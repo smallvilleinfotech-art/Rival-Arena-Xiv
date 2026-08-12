@@ -67,6 +67,7 @@
   @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
   #toast{position:fixed;bottom:90px;left:50%;transform:translateX(-50%);z-index:100;}
   @media (max-width:900px){ .sidebar{display:none;} .bottomnav{display:flex;} .maincontent{padding-bottom:90px;} }
+  @media (max-width:760px){ #tab-content > div[style*="grid-template-columns:minmax(0,520px) 1fr"]{grid-template-columns:1fr !important;} }
   @media (min-width:901px){ .bottomnav{display:none;} }
 </style>
 </head>
@@ -459,6 +460,7 @@ async function openProfileModal(profileId){
   const body = document.getElementById('profile-modal-body');
   modal.style.display = 'flex';
   body.innerHTML = `<div class="skeleton" style="height:220px;border-radius:14px;"></div>`;
+  delete state.profilesById[profileId]; // always show fresh stats in the modal
   await fetchProfilesByIds([profileId]);
   const p = state.profilesById[profileId];
   if (!p) { body.innerHTML = `<p class="text-muted">Player not found.</p>`; return; }
@@ -470,15 +472,16 @@ async function openProfileModal(profileId){
     <div style="text-align:center;">
       <img class="avatar" src="${avatarUrl(p)}" style="width:84px;height:84px;border:3px solid var(--gold);margin:0 auto 10px;"/>
       <div style="font-weight:800;font-size:18px;display:flex;align-items:center;justify-content:center;gap:6px;">${p.username} ${p.verified?'✔️':''}</div>
-      ${p.full_name?`<div class="text-muted" style="font-size:13px;">${escapeHtml(p.full_name)}</div>`:''}
+      <div class="text-muted" style="font-size:11px;font-weight:600;letter-spacing:.03em;">${p.rival_id||''}</div>
+      ${p.full_name?`<div class="text-muted" style="font-size:13px;margin-top:2px;">${escapeHtml(p.full_name)}</div>`:''}
       <div class="text-muted" style="font-size:12px;margin-top:2px;">${[p.position, p.country].filter(Boolean).join(' • ')}</div>
       ${p.bio?`<p style="font-size:13px;margin-top:10px;">${escapeHtml(p.bio)}</p>`:''}
     </div>
     <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:16px 0;">
       <div class="chip" style="padding:8px;text-align:center;"><div style="font-weight:800;color:var(--gold);">${p.ovr}</div><div class="text-muted" style="font-size:10px;">OVR</div></div>
       <div class="chip" style="padding:8px;text-align:center;"><div style="font-weight:800;">#${p.rank}</div><div class="text-muted" style="font-size:10px;">Rank</div></div>
+      <div class="chip" style="padding:8px;text-align:center;"><div style="font-weight:800;">${p.wins}-${p.draws}-${p.losses}</div><div class="text-muted" style="font-size:10px;">W-D-L</div></div>
       <div class="chip" style="padding:8px;text-align:center;"><div style="font-weight:800;">${fmtNum(followers)}</div><div class="text-muted" style="font-size:10px;">Followers</div></div>
-      <div class="chip" style="padding:8px;text-align:center;"><div style="font-weight:800;">${fmtNum(following)}</div><div class="text-muted" style="font-size:10px;">Following</div></div>
     </div>
     ${!isMe ? `
       <div style="display:flex;gap:8px;">
@@ -712,9 +715,18 @@ async function renderCareerTab(){
   const p = state.profile;
   const { data: clubs } = await sb.from('clubs').select('*').order('name');
   const { followers, following } = await getFollowCounts(p.id);
+  const { data: myAch } = await sb.from('player_achievements').select('unlocked_at, achievements(*)').eq('player_id', p.id).order('unlocked_at', { ascending:false });
+  const { data: allAch } = await sb.from('achievements').select('*');
+  const unlockedCodes = new Set((myAch||[]).map(a => a.achievements?.code));
+  const winRate = p.matches_played > 0 ? Math.round((p.wins / p.matches_played) * 100) : 0;
+
   el.innerHTML = `
-    <div class="card fade-in" style="padding:20px;max-width:520px;">
-      <h2 class="font-display" style="margin:0 0 16px;">My Career</h2>
+  <div style="display:grid;grid-template-columns:minmax(0,520px) 1fr;gap:16px;align-items:start;">
+    <div class="card fade-in" style="padding:20px;">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px;">
+        <h2 class="font-display" style="margin:0;">My Career</h2>
+        <span class="chip" style="padding:5px 12px;font-size:12px;color:var(--gold);font-weight:700;letter-spacing:.03em;">${p.rival_id || 'RA-PENDING'}</span>
+      </div>
 
       <div style="display:flex;align-items:center;gap:16px;margin-bottom:18px;">
         <div style="position:relative;">
@@ -752,14 +764,41 @@ async function renderCareerTab(){
         <div><label class="text-muted" style="font-size:12px;">Bio</label><textarea class="input" id="edit-bio" rows="3" placeholder="Tell rivals about yourself…" style="margin-top:4px;resize:vertical;">${p.bio||''}</textarea></div>
         <button class="btn-primary" onclick="saveCareer()">Save Changes</button>
       </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:20px;">
-        <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">OVR</div><div style="font-weight:800;font-size:18px;color:var(--gold);">${p.ovr}</div></div>
-        <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">Rank</div><div style="font-weight:800;font-size:18px;">#${p.rank}</div></div>
-        <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">Fans</div><div style="font-weight:800;font-size:18px;">${fmtNum(p.fans)}</div></div>
-        <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">Market Value</div><div style="font-weight:800;font-size:18px;color:var(--green);">${fmtMoney(p.market_value)}</div></div>
-      </div>
       <button class="btn-ghost" style="margin-top:20px;width:100%;" onclick="logout()">Sign Out</button>
     </div>
+
+    <div style="display:flex;flex-direction:column;gap:16px;">
+      <div class="card fade-in" style="padding:20px;">
+        <h3 class="font-display" style="margin:0 0 14px;font-size:16px;">Career Statistics</h3>
+        <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px;">
+          <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">OVR</div><div style="font-weight:800;font-size:18px;color:var(--gold);">${p.ovr}</div></div>
+          <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">Global Rank</div><div style="font-weight:800;font-size:18px;">#${p.rank}</div></div>
+          <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">Fans</div><div style="font-weight:800;font-size:18px;">${fmtNum(p.fans)}</div></div>
+          <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">Market Value</div><div style="font-weight:800;font-size:18px;color:var(--green);">${fmtMoney(p.market_value)}</div></div>
+          <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">Matches</div><div style="font-weight:800;font-size:18px;">${p.matches_played}</div></div>
+          <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">Win Rate</div><div style="font-weight:800;font-size:18px;">${winRate}%</div></div>
+          <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">W / D / L</div><div style="font-weight:800;font-size:15px;"><span style="color:var(--green);">${p.wins}</span> / <span style="color:var(--muted);">${p.draws}</span> / <span style="color:var(--red);">${p.losses}</span></div></div>
+          <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">Win Streak</div><div style="font-weight:800;font-size:18px;color:#ff8a4c;">🔥 ${p.win_streak}</div></div>
+          <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">Goals For</div><div style="font-weight:800;font-size:18px;">${p.goals_for}</div></div>
+          <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">Goals Against</div><div style="font-weight:800;font-size:18px;">${p.goals_against}</div></div>
+        </div>
+      </div>
+
+      <div class="card fade-in" style="padding:20px;">
+        <h3 class="font-display" style="margin:0 0 4px;font-size:16px;">Achievements</h3>
+        <div class="text-muted" style="font-size:12px;margin-bottom:14px;">${unlockedCodes.size} / ${(allAch||[]).length} unlocked</div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(90px,1fr));gap:10px;">
+          ${(allAch||[]).map(a => {
+            const unlocked = unlockedCodes.has(a.code);
+            return `<div class="chip" title="${escapeHtml(a.description||'')}" style="padding:10px 6px;text-align:center;${unlocked?'':'opacity:.35;filter:grayscale(1);'}">
+              <div style="font-size:22px;">${a.icon}</div>
+              <div style="font-size:10px;font-weight:700;margin-top:4px;line-height:1.2;">${a.name}</div>
+            </div>`;
+          }).join('') || `<div class="text-muted" style="font-size:13px;">No achievements defined yet.</div>`}
+        </div>
+      </div>
+    </div>
+  </div>
   `;
 }
 async function saveCareer(){
@@ -891,10 +930,15 @@ async function renderProPlayersTab(){
   const el = document.getElementById('tab-content');
   const { data: players } = await sb.from('profiles').select('*').neq('id', state.user.id).order('ovr', { ascending:false }).limit(30);
   const { data: myChallenges } = await sb.from('challenges').select('*').or(`challenger_id.eq.${state.user.id},opponent_id.eq.${state.user.id}`).order('created_at', { ascending:false }).limit(20);
-  await fetchProfilesByIds((myChallenges||[]).flatMap(c=>[c.challenger_id,c.opponent_id]));
+  const { data: myMatches } = await sb.from('matches').select('*').or(`player_a.eq.${state.user.id},player_b.eq.${state.user.id}`).order('created_at', { ascending:false }).limit(20);
+  await fetchProfilesByIds([
+    ...(myChallenges||[]).flatMap(c=>[c.challenger_id,c.opponent_id]),
+    ...(myMatches||[]).flatMap(m=>[m.player_a,m.player_b]),
+  ]);
 
   el.innerHTML = `
     <h2 class="font-display" style="margin:0 0 14px;">Pro Players — 1v1</h2>
+    <div id="my-matches" style="margin-bottom:20px;"></div>
     <div id="pending-challenges" style="margin-bottom:20px;"></div>
     <h3 class="text-muted" style="font-size:14px;margin:0 0 10px;">Send a challenge</h3>
     <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;">
@@ -923,14 +967,115 @@ async function renderProPlayersTab(){
     </div>
   `;
   renderPendingChallenges(myChallenges||[]);
+  renderMyMatches(myMatches||[]);
 }
+
+function renderMyMatches(matches){
+  const box = document.getElementById('my-matches');
+  if (!matches.length) { box.innerHTML = ''; return; }
+  const active = matches.filter(m => m.status !== 'confirmed');
+  const recent = matches.filter(m => m.status === 'confirmed').slice(0, 5);
+
+  const matchRow = (m) => {
+    const isA = m.player_a === state.user.id;
+    const me = isA ? m.player_a : m.player_b;
+    const rival = isA ? m.player_b : m.player_a;
+    const rivalName = state.profilesById[rival]?.username || 'Rival';
+
+    if (m.status === 'awaiting_result') {
+      return `<div class="card" style="padding:14px 16px;margin-bottom:8px;">
+        <div style="font-size:13px;margin-bottom:8px;">vs <b>${rivalName}</b> ${m.wager_coins?`<span class="text-muted">• ${fmtNum(m.wager_coins)} coin wager</span>`:''}</div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <input class="input" type="number" min="0" placeholder="Your score" id="my-score-${m.id}" style="width:110px;font-size:12px;padding:6px 10px;"/>
+          <span class="text-muted" style="font-size:12px;">–</span>
+          <input class="input" type="number" min="0" placeholder="Rival score" id="rival-score-${m.id}" style="width:110px;font-size:12px;padding:6px 10px;"/>
+          <button class="btn-gold" style="padding:6px 14px;font-size:12px;" onclick="submitMatchResult('${m.id}','${me}','${rival}')">Submit Result</button>
+        </div>
+      </div>`;
+    }
+    if (m.status === 'awaiting_confirmation') {
+      const iSubmitted = m.submitted_by === state.user.id;
+      const myScore = isA ? m.score_a : m.score_b;
+      const rivalScore = isA ? m.score_b : m.score_a;
+      if (iSubmitted) {
+        return `<div class="card" style="padding:14px 16px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+          <span style="font-size:13px;">vs <b>${rivalName}</b> — you reported <b>${myScore}-${rivalScore}</b></span>
+          <span class="chip" style="font-size:11px;padding:2px 10px;color:var(--gold);">Waiting for rival to confirm</span>
+        </div>`;
+      }
+      return `<div class="card" style="padding:14px 16px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+        <span style="font-size:13px;"><b>${rivalName}</b> reported <b>${rivalScore}-${myScore}</b> (them-you)</span>
+        <div style="display:flex;gap:6px;">
+          <button class="btn-gold" style="padding:6px 12px;font-size:12px;" onclick="confirmMatchResult('${m.id}', true)">Confirm</button>
+          <button class="btn-ghost" style="padding:6px 12px;font-size:12px;" onclick="confirmMatchResult('${m.id}', false)">Dispute</button>
+        </div>
+      </div>`;
+    }
+    return '';
+  };
+
+  const recentRow = (m) => {
+    const isA = m.player_a === state.user.id;
+    const rival = isA ? m.player_b : m.player_a;
+    const rivalName = state.profilesById[rival]?.username || 'Rival';
+    const myScore = isA ? m.score_a : m.score_b;
+    const rivalScore = isA ? m.score_b : m.score_a;
+    const outcome = myScore > rivalScore ? 'W' : myScore < rivalScore ? 'L' : 'D';
+    const color = outcome==='W' ? 'var(--green)' : outcome==='L' ? 'var(--red)' : 'var(--muted)';
+    return `<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px;">
+      <span>vs ${rivalName}</span>
+      <span><b>${myScore}-${rivalScore}</b> <span style="color:${color};font-weight:800;">${outcome}</span></span>
+    </div>`;
+  };
+
+  box.innerHTML = `
+    ${active.length ? `<div style="margin-bottom:10px;">
+      <div class="text-muted" style="font-size:13px;margin-bottom:6px;">My Matches</div>
+      ${active.map(matchRow).join('')}
+    </div>` : ''}
+    ${recent.length ? `<details class="card" style="padding:12px 16px;">
+      <summary style="cursor:pointer;font-size:13px;font-weight:700;">Recent results</summary>
+      <div style="margin-top:8px;">${recent.map(recentRow).join('')}</div>
+    </details>` : ''}
+  `;
+}
+
+async function submitMatchResult(matchId, meId, rivalId){
+  const myScoreEl = document.getElementById(`my-score-${matchId}`);
+  const rivalScoreEl = document.getElementById(`rival-score-${matchId}`);
+  const myScore = parseInt(myScoreEl.value);
+  const rivalScore = parseInt(rivalScoreEl.value);
+  if (isNaN(myScore) || isNaN(rivalScore) || myScore < 0 || rivalScore < 0) { toast('Enter both scores', false); return; }
+
+  // matches store score_a/score_b tied to player_a/player_b, not "me/rival" — map correctly
+  const { data: match } = await sb.from('matches').select('player_a').eq('id', matchId).single();
+  const iAmA = match?.player_a === state.user.id;
+  const score_a = iAmA ? myScore : rivalScore;
+  const score_b = iAmA ? rivalScore : myScore;
+
+  const { error } = await sb.rpc('submit_match_result', { p_match_id: matchId, p_score_a: score_a, p_score_b: score_b });
+  if (error) { toast(error.message, false); return; }
+  toast('Result submitted — waiting for your rival to confirm');
+  await renderProPlayersTab();
+}
+window.submitMatchResult = submitMatchResult;
+
+async function confirmMatchResult(matchId, agree){
+  const { error } = await sb.rpc('confirm_match_result', { p_match_id: matchId, p_agree: agree });
+  if (error) { toast(error.message, false); return; }
+  toast(agree ? 'Match confirmed — stats updated 🏆' : 'Result disputed — your rival can resubmit');
+  await renderProPlayersTab();
+  await loadProfile();
+}
+window.confirmMatchResult = confirmMatchResult;
+
 function renderPendingChallenges(list){
   const box = document.getElementById('pending-challenges');
   const incoming = list.filter(c=>c.opponent_id===state.user.id && c.status==='pending');
   const outgoing = list.filter(c=>c.challenger_id===state.user.id);
   box.innerHTML = `
     ${incoming.length ? `<div style="margin-bottom:12px;">
-      <div style="font-size:13px;color:var(--muted);margin-bottom:6px;">Incoming challenges</div>
+      <div class="text-muted" style="font-size:13px;margin-bottom:6px;">Incoming challenges</div>
       ${incoming.map(c=>`
         <div class="card" style="padding:12px 16px;display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
           <span style="font-size:13px;"><b>${state.profilesById[c.challenger_id]?.username}</b> challenged you${c.wager_coins?` for ${fmtNum(c.wager_coins)} coins`:''}</span>
@@ -941,7 +1086,7 @@ function renderPendingChallenges(list){
         </div>`).join('')}
     </div>` : ''}
     ${outgoing.length ? `<div>
-      <div style="font-size:13px;color:var(--muted);margin-bottom:6px;">Your sent challenges</div>
+      <div class="text-muted" style="font-size:13px;margin-bottom:6px;">Your sent challenges</div>
       ${outgoing.map(c=>`
         <div class="card" style="padding:10px 16px;display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;font-size:13px;">
           <span>vs <b>${state.profilesById[c.opponent_id]?.username}</b></span>
@@ -965,6 +1110,17 @@ window.sendChallenge = sendChallenge;
 async function respondChallenge(challengeId, status){
   const { data, error } = await sb.from('challenges').update({ status, resolved_at: new Date().toISOString() }).eq('id', challengeId).select().single();
   if (error) { toast(error.message, false); return; }
+  if (status === 'accepted' && data) {
+    // opponent (current user) is accepting — create the match record the two will play
+    const { error: matchErr } = await sb.from('matches').insert({
+      challenge_id: data.id,
+      player_a: data.challenger_id,
+      player_b: data.opponent_id,
+      wager_coins: data.wager_coins || 0,
+    });
+    if (matchErr) toast(matchErr.message, false);
+    await sb.from('notifications').insert({ user_id: data.challenger_id, title:'Challenge accepted', body:`${state.profile.username} accepted your challenge. Play it out, then submit the score.`, type:'challenge' });
+  }
   toast(status === 'accepted' ? 'Challenge accepted 🔥' : 'Challenge declined');
   await renderProPlayersTab();
 }
@@ -1070,6 +1226,23 @@ function subscribeRealtime(){
     .on('postgres_changes', { event:'*', schema:'public', table:'challenges', filter:`challenger_id=eq.${state.user.id}` }, () => refreshIfActive(['pro']))
     .subscribe();
   state.channels.push(challengeCh);
+
+  // --- matches: submit / confirm / dispute, live for both participants ---
+  const matchesCh = sb.channel('rt-matches')
+    .on('postgres_changes', { event:'*', schema:'public', table:'matches', filter:`player_a=eq.${state.user.id}` }, async () => { await loadProfile(); refreshIfActive(['pro']); })
+    .on('postgres_changes', { event:'*', schema:'public', table:'matches', filter:`player_b=eq.${state.user.id}` }, async () => { await loadProfile(); refreshIfActive(['pro']); })
+    .subscribe();
+  state.channels.push(matchesCh);
+
+  // --- achievements: toast the moment one unlocks ---
+  const achCh = sb.channel('rt-achievements')
+    .on('postgres_changes', { event:'INSERT', schema:'public', table:'player_achievements', filter:`player_id=eq.${state.user.id}` }, async (payload) => {
+      const { data: ach } = await sb.from('achievements').select('*').eq('id', payload.new.achievement_id).single();
+      if (ach) toast(`🏆 Achievement unlocked: ${ach.name}`);
+      refreshIfActive(['career']);
+    })
+    .subscribe();
+  state.channels.push(achCh);
 
   // --- feed: posts, likes, comments (global — feed is a shared space) ---
   const feedCh = sb.channel('rt-feed')
