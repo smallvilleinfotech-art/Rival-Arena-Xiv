@@ -35,11 +35,19 @@
   ::-webkit-scrollbar{width:8px;height:8px;}
   ::-webkit-scrollbar-thumb{background:var(--panel-3);border-radius:8px;}
   a{color:inherit;text-decoration:none;}
-  button{font-family:inherit;cursor:pointer;}
+  button{font-family:inherit;cursor:pointer;color:inherit;}
+  select{font-family:inherit;color:var(--text);}
+  ::placeholder{color:var(--muted);opacity:1;}
+  button:disabled{opacity:.5;cursor:not-allowed;}
+  .btn-primary:disabled,.btn-gold:disabled{filter:none;}
+  a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid var(--gold-2);outline-offset:2px;}
   .glow-gold{background:linear-gradient(135deg,var(--gold),var(--gold-2));}
   .glow-purple{background:linear-gradient(135deg,var(--purple),var(--purple-2));}
-  .card{background:var(--panel);border:1px solid var(--border);border-radius:16px;}
-  .chip{background:var(--panel-2);border:1px solid var(--border);border-radius:999px;}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:16px;color:var(--text);}
+  .card button, button.card{color:var(--text);}
+  .chip{background:var(--panel-2);border:1px solid var(--border);border-radius:999px;color:var(--text);}
+  .text-muted{color:var(--muted);}
+  .online-dot{width:9px;height:9px;border-radius:50%;background:var(--green);border:2px solid var(--panel);display:inline-block;}
   .tab-active{color:var(--gold);border-bottom:2px solid var(--gold);}
   .tab-inactive{color:var(--muted);border-bottom:2px solid transparent;}
   .nav-item{display:flex;align-items:center;gap:12px;padding:12px 16px;border-radius:12px;color:var(--muted);font-weight:600;font-size:14px;}
@@ -156,6 +164,14 @@
 
 <div id="toast"></div>
 
+<!-- PLAYER PROFILE MODAL -->
+<div id="profile-modal" style="display:none;position:fixed;inset:0;background:rgba(4,4,10,.7);z-index:200;align-items:center;justify-content:center;padding:20px;" onclick="if(event.target===this) closeProfileModal();">
+  <div class="card fade-in" id="profile-modal-body" style="max-width:420px;width:100%;padding:22px;max-height:85vh;overflow-y:auto;"></div>
+</div>
+
+<!-- hidden avatar file input, reused by the Career tab -->
+<input type="file" id="avatar-file-input" accept="image/*" style="display:none;" onchange="handleAvatarUpload(event)"/>
+
 <script>
 /* ==========================================================================
    1. CONFIG — paste your Supabase project credentials here
@@ -180,6 +196,10 @@ const state = {
   activeTab: 'feed',
   feedFilter: 'All',
   notifUnread: 0,
+  followingIds: new Set(),   // ids of players the current user follows
+  followerCounts: {},        // cache: profileId -> follower count
+  followingCounts: {},       // cache: profileId -> following count
+  channels: [],               // active Supabase Realtime channels
 };
 
 const ICONS = {
@@ -355,8 +375,10 @@ async function onLoggedIn(user){
   document.getElementById('app').style.display = 'block';
   await loadProfile();
   await loadUnreadCount();
+  await loadFollowing();
   renderSidebar(); renderBottomNav();
   await setTab('feed');
+  subscribeRealtime();
 }
 
 async function loadProfile(){
@@ -392,7 +414,88 @@ async function loadUnreadCount(){
   state.notifUnread = count || 0;
 }
 
-function logout(){ sb.auth.signOut(); }
+async function loadFollowing(){
+  const { data } = await sb.from('follows').select('following_id').eq('follower_id', state.user.id);
+  state.followingIds = new Set((data||[]).map(f=>f.following_id));
+}
+
+async function getFollowCounts(profileId){
+  const [{ count: followers }, { count: following }] = await Promise.all([
+    sb.from('follows').select('id', { count:'exact', head:true }).eq('following_id', profileId),
+    sb.from('follows').select('id', { count:'exact', head:true }).eq('follower_id', profileId),
+  ]);
+  state.followerCounts[profileId] = followers || 0;
+  state.followingCounts[profileId] = following || 0;
+  return { followers: followers||0, following: following||0 };
+}
+
+async function toggleFollow(targetId){
+  if (targetId === state.user.id) return;
+  const isFollowing = state.followingIds.has(targetId);
+  if (isFollowing){
+    await sb.from('follows').delete().eq('follower_id', state.user.id).eq('following_id', targetId);
+    state.followingIds.delete(targetId);
+    toast('Unfollowed');
+  } else {
+    const { error } = await sb.from('follows').insert({ follower_id: state.user.id, following_id: targetId });
+    if (error) { toast(error.message, false); return; }
+    state.followingIds.add(targetId);
+    toast('Now following ✅');
+    await sb.from('notifications').insert({ user_id: targetId, title:'New follower', body:`${state.profile.username} started following you.`, type:'system' });
+  }
+  // refresh whatever tab is showing player cards
+  if (['pro','rankings'].includes(state.activeTab)) {
+    const renderers = { pro: renderProPlayersTab, rankings: renderRankingsTab };
+    await renderers[state.activeTab]();
+  }
+  const modalFollowBtn = document.getElementById(`modal-follow-btn-${targetId}`);
+  if (modalFollowBtn) openProfileModal(targetId); // re-render modal with fresh state
+}
+window.toggleFollow = toggleFollow;
+
+/* ---- Player profile modal ---- */
+async function openProfileModal(profileId){
+  const modal = document.getElementById('profile-modal');
+  const body = document.getElementById('profile-modal-body');
+  modal.style.display = 'flex';
+  body.innerHTML = `<div class="skeleton" style="height:220px;border-radius:14px;"></div>`;
+  await fetchProfilesByIds([profileId]);
+  const p = state.profilesById[profileId];
+  if (!p) { body.innerHTML = `<p class="text-muted">Player not found.</p>`; return; }
+  const { followers, following } = await getFollowCounts(profileId);
+  const isMe = profileId === state.user.id;
+  const isFollowing = state.followingIds.has(profileId);
+  body.innerHTML = `
+    <div style="display:flex;justify-content:flex-end;"><button onclick="closeProfileModal()" style="background:none;border:none;color:var(--muted);font-size:20px;line-height:1;">✕</button></div>
+    <div style="text-align:center;">
+      <img class="avatar" src="${avatarUrl(p)}" style="width:84px;height:84px;border:3px solid var(--gold);margin:0 auto 10px;"/>
+      <div style="font-weight:800;font-size:18px;display:flex;align-items:center;justify-content:center;gap:6px;">${p.username} ${p.verified?'✔️':''}</div>
+      ${p.full_name?`<div class="text-muted" style="font-size:13px;">${escapeHtml(p.full_name)}</div>`:''}
+      <div class="text-muted" style="font-size:12px;margin-top:2px;">${[p.position, p.country].filter(Boolean).join(' • ')}</div>
+      ${p.bio?`<p style="font-size:13px;margin-top:10px;">${escapeHtml(p.bio)}</p>`:''}
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:16px 0;">
+      <div class="chip" style="padding:8px;text-align:center;"><div style="font-weight:800;color:var(--gold);">${p.ovr}</div><div class="text-muted" style="font-size:10px;">OVR</div></div>
+      <div class="chip" style="padding:8px;text-align:center;"><div style="font-weight:800;">#${p.rank}</div><div class="text-muted" style="font-size:10px;">Rank</div></div>
+      <div class="chip" style="padding:8px;text-align:center;"><div style="font-weight:800;">${fmtNum(followers)}</div><div class="text-muted" style="font-size:10px;">Followers</div></div>
+      <div class="chip" style="padding:8px;text-align:center;"><div style="font-weight:800;">${fmtNum(following)}</div><div class="text-muted" style="font-size:10px;">Following</div></div>
+    </div>
+    ${!isMe ? `
+      <div style="display:flex;gap:8px;">
+        <button id="modal-follow-btn-${p.id}" class="${isFollowing?'btn-ghost':'btn-primary'}" style="flex:1;" onclick="toggleFollow('${p.id}')">${isFollowing?'Following ✓':'Follow'}</button>
+        <button class="btn-gold" style="flex:1;" onclick="closeProfileModal(); setTab('pro');" >Challenge</button>
+      </div>` : `<button class="btn-ghost" style="width:100%;" onclick="closeProfileModal(); setTab('career');">Edit My Career</button>`}
+  `;
+}
+function closeProfileModal(){ document.getElementById('profile-modal').style.display = 'none'; }
+window.openProfileModal = openProfileModal;
+window.closeProfileModal = closeProfileModal;
+
+function logout(){
+  state.channels.forEach(ch => sb.removeChannel(ch));
+  state.channels = [];
+  sb.auth.signOut();
+}
 window.logout = logout;
 
 /* ==========================================================================
@@ -471,11 +574,26 @@ window.setFeedFilter = setFeedFilter;
 async function loadFeed(){
   const listEl = document.getElementById('feed-list');
   listEl.innerHTML = `<div class="skeleton" style="height:140px;border-radius:16px;margin-bottom:12px;"></div>`.repeat(3);
-  let query = sb.from('posts').select('*').order('created_at', { ascending:false }).limit(30);
-  if (state.feedFilter !== 'All') query = query.eq('category', state.feedFilter);
+
+  if (state.feedFilter === 'Following' && state.followingIds.size === 0) {
+    listEl.innerHTML = `<div class="card" style="padding:28px;text-align:center;">
+      <div style="font-size:26px;margin-bottom:8px;">👥</div>
+      <div style="font-weight:700;">You're not following anyone yet</div>
+      <div class="text-muted" style="font-size:13px;margin-top:4px;">Follow players from Rankings or Pro Players to see their posts here.</div>
+      <button class="btn-primary" style="margin-top:12px;" onclick="setTab('rankings')">Browse Rankings</button>
+    </div>`;
+    return;
+  }
+
+  let query = sb.from('posts').select('*').order('created_at', { ascending:false }).limit(50);
+  if (state.feedFilter === 'Following') {
+    query = query.in('author_id', [...state.followingIds]);
+  } else if (state.feedFilter !== 'All') {
+    query = query.eq('category', state.feedFilter);
+  }
   const { data: posts, error } = await query;
-  if (error) { listEl.innerHTML = `<p style="color:var(--muted);">Couldn't load feed: ${error.message}</p>`; return; }
-  if (!posts || !posts.length) { listEl.innerHTML = `<div class="card" style="padding:24px;text-align:center;color:var(--muted);">No posts yet. Be the first to share something.</div>`; return; }
+  if (error) { listEl.innerHTML = `<p class="text-muted">Couldn't load feed: ${error.message}</p>`; return; }
+  if (!posts || !posts.length) { listEl.innerHTML = `<div class="card" style="padding:24px;text-align:center;" class="text-muted">No posts yet. Be the first to share something.</div>`; return; }
 
   await fetchProfilesByIds(posts.map(p=>p.author_id));
   const postIds = posts.map(p=>p.id);
@@ -490,7 +608,7 @@ async function loadFeed(){
     const author = state.profilesById[post.author_id] || {};
     return `
     <div class="card fade-in" style="padding:16px;margin-bottom:14px;">
-      <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;cursor:pointer;" onclick="openProfileModal('${post.author_id}')">
         <img class="avatar" src="${avatarUrl(author)}" style="width:40px;height:40px;"/>
         <div style="flex:1;min-width:0;">
           <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
@@ -593,30 +711,52 @@ async function renderCareerTab(){
   const el = document.getElementById('tab-content');
   const p = state.profile;
   const { data: clubs } = await sb.from('clubs').select('*').order('name');
+  const { followers, following } = await getFollowCounts(p.id);
   el.innerHTML = `
-    <div class="card fade-in" style="padding:20px;max-width:480px;">
+    <div class="card fade-in" style="padding:20px;max-width:520px;">
       <h2 class="font-display" style="margin:0 0 16px;">My Career</h2>
-      <div style="display:flex;flex-direction:column;gap:12px;">
-        <div><label style="font-size:12px;color:var(--muted);">Username</label><input class="input" id="edit-username" value="${p.username}" style="margin-top:4px;"/></div>
-        <div><label style="font-size:12px;color:var(--muted);">Position</label>
-          <select class="input" id="edit-position" style="margin-top:4px;">
-            ${['GK','CB','LB','RB','CDM','CM','CAM','LW','RW','ST'].map(pos=>`<option ${p.position===pos?'selected':''}>${pos}</option>`).join('')}
-          </select>
+
+      <div style="display:flex;align-items:center;gap:16px;margin-bottom:18px;">
+        <div style="position:relative;">
+          <img id="career-avatar-preview" class="avatar" src="${avatarUrl(p)}" style="width:76px;height:76px;border:2px solid var(--gold);"/>
+          <button onclick="triggerAvatarUpload()" title="Change photo" style="position:absolute;bottom:-4px;right:-4px;background:var(--purple);border:2px solid var(--panel);border-radius:50%;width:26px;height:26px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:13px;">📷</button>
         </div>
-        <div><label style="font-size:12px;color:var(--muted);">Club</label>
+        <div>
+          <button class="btn-ghost" style="padding:7px 14px;font-size:12px;" onclick="triggerAvatarUpload()">Change Photo</button>
+          <div class="text-muted" style="font-size:11px;margin-top:6px;">JPG or PNG, up to 5MB</div>
+        </div>
+      </div>
+
+      <div style="display:flex;gap:10px;margin-bottom:18px;">
+        <div class="chip" style="padding:8px 14px;flex:1;text-align:center;"><div style="font-weight:800;">${fmtNum(followers)}</div><div class="text-muted" style="font-size:11px;">Followers</div></div>
+        <div class="chip" style="padding:8px 14px;flex:1;text-align:center;"><div style="font-weight:800;">${fmtNum(following)}</div><div class="text-muted" style="font-size:11px;">Following</div></div>
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:12px;">
+        <div><label class="text-muted" style="font-size:12px;">Username</label><input class="input" id="edit-username" value="${p.username}" style="margin-top:4px;"/></div>
+        <div><label class="text-muted" style="font-size:12px;">Full Name</label><input class="input" id="edit-fullname" value="${p.full_name||''}" placeholder="Your real name" style="margin-top:4px;"/></div>
+        <div style="display:flex;gap:10px;">
+          <div style="flex:1;"><label class="text-muted" style="font-size:12px;">Position</label>
+            <select class="input" id="edit-position" style="margin-top:4px;">
+              ${['GK','CB','LB','RB','CDM','CM','CAM','LW','RW','ST'].map(pos=>`<option ${p.position===pos?'selected':''}>${pos}</option>`).join('')}
+            </select>
+          </div>
+          <div style="flex:1;"><label class="text-muted" style="font-size:12px;">Country</label><input class="input" id="edit-country" value="${p.country||''}" placeholder="e.g. Nigeria" style="margin-top:4px;"/></div>
+        </div>
+        <div><label class="text-muted" style="font-size:12px;">Club</label>
           <select class="input" id="edit-club" style="margin-top:4px;">
             <option value="">— Free Agent —</option>
             ${(clubs||[]).map(c=>`<option value="${c.id}" ${p.club_id===c.id?'selected':''}>${c.name}</option>`).join('')}
           </select>
         </div>
-        <div><label style="font-size:12px;color:var(--muted);">Bio</label><textarea class="input" id="edit-bio" rows="3" style="margin-top:4px;resize:vertical;">${p.bio||''}</textarea></div>
+        <div><label class="text-muted" style="font-size:12px;">Bio</label><textarea class="input" id="edit-bio" rows="3" placeholder="Tell rivals about yourself…" style="margin-top:4px;resize:vertical;">${p.bio||''}</textarea></div>
         <button class="btn-primary" onclick="saveCareer()">Save Changes</button>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:20px;">
-        <div class="chip" style="padding:10px;"><div style="color:var(--muted);font-size:11px;">OVR</div><div style="font-weight:800;font-size:18px;color:var(--gold);">${p.ovr}</div></div>
-        <div class="chip" style="padding:10px;"><div style="color:var(--muted);font-size:11px;">Rank</div><div style="font-weight:800;font-size:18px;">#${p.rank}</div></div>
-        <div class="chip" style="padding:10px;"><div style="color:var(--muted);font-size:11px;">Fans</div><div style="font-weight:800;font-size:18px;">${fmtNum(p.fans)}</div></div>
-        <div class="chip" style="padding:10px;"><div style="color:var(--muted);font-size:11px;">Market Value</div><div style="font-weight:800;font-size:18px;color:var(--green);">${fmtMoney(p.market_value)}</div></div>
+        <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">OVR</div><div style="font-weight:800;font-size:18px;color:var(--gold);">${p.ovr}</div></div>
+        <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">Rank</div><div style="font-weight:800;font-size:18px;">#${p.rank}</div></div>
+        <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">Fans</div><div style="font-weight:800;font-size:18px;">${fmtNum(p.fans)}</div></div>
+        <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">Market Value</div><div style="font-weight:800;font-size:18px;color:var(--green);">${fmtMoney(p.market_value)}</div></div>
       </div>
       <button class="btn-ghost" style="margin-top:20px;width:100%;" onclick="logout()">Sign Out</button>
     </div>
@@ -625,6 +765,8 @@ async function renderCareerTab(){
 async function saveCareer(){
   const updates = {
     username: document.getElementById('edit-username').value.trim(),
+    full_name: document.getElementById('edit-fullname').value.trim(),
+    country: document.getElementById('edit-country').value.trim(),
     position: document.getElementById('edit-position').value,
     club_id: document.getElementById('edit-club').value || null,
     bio: document.getElementById('edit-bio').value.trim(),
@@ -727,14 +869,17 @@ async function renderRankingsTab(){
   el.innerHTML = `<h2 class="font-display" style="margin:0 0 14px;">Rankings</h2>
     <div class="card" style="overflow:hidden;">
       ${(players||[]).map((p,i)=>`
-        <div style="display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid var(--border);${p.id===state.user.id?'background:rgba(124,58,237,.08);':''}">
+        <div style="display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid var(--border);${p.id===state.user.id?'background:rgba(124,58,237,.1);':''}">
           <div style="width:26px;text-align:center;font-weight:800;color:${i<3?'var(--gold)':'var(--muted)'};">${i+1}</div>
-          <img class="avatar" src="${avatarUrl(p)}" style="width:34px;height:34px;"/>
-          <div style="flex:1;min-width:0;">
-            <div style="font-weight:700;font-size:14px;">${p.username} ${p.verified?'✔️':''}</div>
-            <div style="color:var(--muted);font-size:12px;">${p.position} • ${fmtNum(p.fans)} fans</div>
+          <div style="display:flex;align-items:center;gap:10px;flex:1;min-width:0;cursor:pointer;" onclick="openProfileModal('${p.id}')">
+            <img class="avatar" src="${avatarUrl(p)}" style="width:34px;height:34px;"/>
+            <div style="min-width:0;">
+              <div style="font-weight:700;font-size:14px;">${p.username} ${p.verified?'✔️':''}</div>
+              <div class="text-muted" style="font-size:12px;">${p.position} • ${fmtNum(p.fans)} fans</div>
+            </div>
           </div>
           <div style="font-weight:800;color:var(--gold);">${p.ovr}</div>
+          ${p.id!==state.user.id ? `<button class="btn-ghost" style="padding:5px 10px;font-size:11px;" onclick="toggleFollow('${p.id}')">${state.followingIds.has(p.id)?'✓':'+ Follow'}</button>` : ''}
         </div>`).join('')}
     </div>`;
 }
@@ -751,22 +896,30 @@ async function renderProPlayersTab(){
   el.innerHTML = `
     <h2 class="font-display" style="margin:0 0 14px;">Pro Players — 1v1</h2>
     <div id="pending-challenges" style="margin-bottom:20px;"></div>
-    <h3 style="font-size:14px;color:var(--muted);margin:0 0 10px;">Send a challenge</h3>
+    <h3 class="text-muted" style="font-size:14px;margin:0 0 10px;">Send a challenge</h3>
     <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;">
       ${(players||[]).map(p=>`
         <div class="card fade-in" style="padding:14px;">
-          <div style="display:flex;align-items:center;gap:10px;">
+          <div style="display:flex;align-items:center;gap:10px;cursor:pointer;" onclick="openProfileModal('${p.id}')">
             <img class="avatar" src="${avatarUrl(p)}" style="width:38px;height:38px;"/>
             <div>
               <div style="font-weight:700;font-size:13px;">${p.username}</div>
-              <div style="color:var(--muted);font-size:11px;">${p.ovr} OVR • ${p.position}</div>
+              <div class="text-muted" style="font-size:11px;">${p.ovr} OVR • ${p.position}</div>
             </div>
           </div>
           <div style="display:flex;gap:6px;margin-top:10px;">
             <input class="input" type="number" min="0" placeholder="Wager" id="wager-${p.id}" style="font-size:12px;padding:6px 10px;"/>
             <button class="btn-primary" style="padding:6px 12px;font-size:12px;white-space:nowrap;" onclick="sendChallenge('${p.id}')">Challenge</button>
           </div>
-        </div>`).join('')}
+          <button class="btn-ghost" style="width:100%;margin-top:6px;padding:6px;font-size:12px;" onclick="toggleFollow('${p.id}')">
+            ${state.followingIds.has(p.id) ? 'Following ✓' : '+ Follow'}
+          </button>
+        </div>`).join('') || `
+        <div class="card" style="grid-column:1/-1;padding:28px;text-align:center;">
+          <div style="font-size:28px;margin-bottom:8px;">🕹️</div>
+          <div style="font-weight:700;">No other players yet</div>
+          <div class="text-muted" style="font-size:13px;margin-top:4px;">Invite rivals to Rival Arena — the moment they sign up, they'll show up here to challenge.</div>
+        </div>`}
     </div>
   `;
   renderPendingChallenges(myChallenges||[]);
@@ -875,6 +1028,110 @@ async function markRead(id){
   await renderInboxTab();
 }
 window.markRead = markRead;
+
+/* ==========================================================================
+   13. REALTIME — keeps every tab live without manual refresh
+   ========================================================================== */
+function debounce(fn, ms){
+  let t;
+  return (...args) => { clearTimeout(t); t = setTimeout(()=>fn(...args), ms); };
+}
+
+function subscribeRealtime(){
+  if (!sb || !state.user) return;
+  state.channels.forEach(ch => sb.removeChannel(ch));
+  state.channels = [];
+
+  const refreshIfActive = debounce(async (tabIds) => {
+    if (tabIds.includes(state.activeTab)) {
+      const renderers = {
+        feed: loadFeed, career: renderCareerTab, clubs: renderClubsTab,
+        tournaments: renderTournamentsTab, rankings: renderRankingsTab,
+        pro: renderProPlayersTab, shop: renderShopTab, inbox: renderInboxTab,
+      };
+      await renderers[state.activeTab]();
+    }
+  }, 350);
+
+  // --- notifications: only mine ---
+  const notifCh = sb.channel('rt-notifications')
+    .on('postgres_changes', { event:'INSERT', schema:'public', table:'notifications', filter:`user_id=eq.${state.user.id}` }, (payload) => {
+      state.notifUnread += 1;
+      renderSidebar(); renderBottomNav();
+      toast(`🔔 ${payload.new.title}`);
+      refreshIfActive(['inbox']);
+    })
+    .subscribe();
+  state.channels.push(notifCh);
+
+  // --- challenges: incoming + outgoing ---
+  const challengeCh = sb.channel('rt-challenges')
+    .on('postgres_changes', { event:'*', schema:'public', table:'challenges', filter:`opponent_id=eq.${state.user.id}` }, () => refreshIfActive(['pro']))
+    .on('postgres_changes', { event:'*', schema:'public', table:'challenges', filter:`challenger_id=eq.${state.user.id}` }, () => refreshIfActive(['pro']))
+    .subscribe();
+  state.channels.push(challengeCh);
+
+  // --- feed: posts, likes, comments (global — feed is a shared space) ---
+  const feedCh = sb.channel('rt-feed')
+    .on('postgres_changes', { event:'*', schema:'public', table:'posts' }, () => refreshIfActive(['feed']))
+    .on('postgres_changes', { event:'*', schema:'public', table:'post_likes' }, () => refreshIfActive(['feed']))
+    .on('postgres_changes', { event:'*', schema:'public', table:'post_comments' }, () => refreshIfActive(['feed']))
+    .subscribe();
+  state.channels.push(feedCh);
+
+  // --- tournaments ---
+  const tourneyCh = sb.channel('rt-tournaments')
+    .on('postgres_changes', { event:'*', schema:'public', table:'tournament_participants' }, () => refreshIfActive(['tournaments']))
+    .on('postgres_changes', { event:'*', schema:'public', table:'tournaments' }, () => refreshIfActive(['tournaments']))
+    .subscribe();
+  state.channels.push(tourneyCh);
+
+  // --- social graph: follows + live rank/coin/fan changes on any profile ---
+  const socialCh = sb.channel('rt-social')
+    .on('postgres_changes', { event:'*', schema:'public', table:'follows' }, async () => {
+      await loadFollowing();
+      refreshIfActive(['pro','rankings']);
+    })
+    .on('postgres_changes', { event:'UPDATE', schema:'public', table:'profiles' }, (payload) => {
+      state.profilesById[payload.new.id] = payload.new;
+      if (payload.new.id === state.user.id) { state.profile = payload.new; renderProfileBar(); }
+      refreshIfActive(['rankings','clubs']);
+    })
+    .subscribe();
+  state.channels.push(socialCh);
+}
+
+/* ==========================================================================
+   14. AVATAR UPLOAD
+   ========================================================================== */
+function triggerAvatarUpload(){ document.getElementById('avatar-file-input').click(); }
+window.triggerAvatarUpload = triggerAvatarUpload;
+
+async function handleAvatarUpload(e){
+  const file = e.target.files[0];
+  if (!file) return;
+  if (!file.type.startsWith('image/')) { toast('Please choose an image file', false); return; }
+  if (file.size > 5 * 1024 * 1024) { toast('Image must be under 5MB', false); return; }
+
+  toast('Uploading photo…');
+  const ext = (file.name.split('.').pop() || 'jpg').toLowerCase();
+  const path = `${state.user.id}/avatar.${ext}`;
+  const { error: upErr } = await sb.storage.from('avatars').upload(path, file, { upsert: true, cacheControl: '3600' });
+  if (upErr) { toast(upErr.message, false); return; }
+
+  const { data: pub } = sb.storage.from('avatars').getPublicUrl(path);
+  const avatar_url = `${pub.publicUrl}?t=${Date.now()}`; // cache-bust
+  const { data, error } = await sb.from('profiles').update({ avatar_url }).eq('id', state.user.id).select().single();
+  if (error) { toast(error.message, false); return; }
+
+  state.profile = data; state.profilesById[data.id] = data;
+  renderProfileBar();
+  const preview = document.getElementById('career-avatar-preview');
+  if (preview) preview.src = avatar_url;
+  toast('Profile photo updated ✅');
+  e.target.value = '';
+}
+window.handleAvatarUpload = handleAvatarUpload;
 
 /* ==========================================================================
    BOOT
