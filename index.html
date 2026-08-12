@@ -202,6 +202,8 @@ const state = {
   feedFilter: 'All',
   notifUnread: 0,
   followingIds: new Set(),   // ids of players the current user follows
+  currentClubProfileId: null, // set when viewing a specific club's profile within the Clubs tab
+  clubProfileTab: 'Overview', // Overview | Posts | Squad | Trophies | History
   followerCounts: {},        // cache: profileId -> follower count
   followingCounts: {},       // cache: profileId -> following count
   channels: [],               // active Supabase Realtime channels
@@ -293,6 +295,7 @@ function renderBottomNav(){
 
 async function setTab(id){
   state.activeTab = id;
+  if (id === 'clubs') state.currentClubProfileId = null; // fresh nav always lands on Club Home
   renderSidebar(); renderBottomNav();
   const el = document.getElementById('tab-content');
   el.innerHTML = `<div class="skeleton" style="height:220px;border-radius:16px;"></div>`;
@@ -1177,29 +1180,293 @@ window.saveCareer = saveCareer;
 /* ==========================================================================
    7. CLUBS TAB
    ========================================================================== */
-async function renderClubsTab(){
-  const el = document.getElementById('tab-content');
-  const { data: clubs } = await sb.from('clubs').select('*').order('name');
-  const { data: members } = await sb.from('profiles').select('id,username,club_id,ovr,verified');
-  el.innerHTML = `<h2 class="font-display" style="margin:0 0 14px;">Clubs</h2>
-    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px;">
-    ${(clubs||[]).map(c => {
-      const roster = (members||[]).filter(m=>m.club_id===c.id);
-      return `<div class="card fade-in" style="padding:16px;">
-        <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
-          <div class="glow-purple" style="width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-weight:800;">${initials(c.name)}</div>
-          <div>
-            <div style="font-weight:700;">${c.name}</div>
-            <div style="color:var(--muted);font-size:12px;">${roster.length} player${roster.length===1?'':'s'}</div>
-          </div>
-        </div>
-        <div style="display:flex;flex-direction:column;gap:6px;">
-          ${roster.slice(0,5).map(r=>`<div style="display:flex;justify-content:space-between;font-size:13px;"><span>${r.username}</span><span style="color:var(--gold);">${r.ovr} OVR</span></div>`).join('') || `<div style="color:var(--muted);font-size:13px;">No players yet.</div>`}
-        </div>
-      </div>`;
-    }).join('')}
-    </div>`;
+/* ==========================================================================
+   8. CLUB SYSTEM — home (My Club / Top Clubs / All Clubs) + Club Profile
+   ========================================================================== */
+async function getAllClubsWithStats(){
+  const [{ data: clubs }, { data: roster }, { data: trophyAwards }] = await Promise.all([
+    sb.from('clubs').select('*').order('name'),
+    sb.from('profiles').select('id,username,club_id,ovr'),
+    sb.from('club_trophy_awards').select('club_id'),
+  ]);
+  const trophyCounts = {};
+  (trophyAwards||[]).forEach(t => trophyCounts[t.club_id] = (trophyCounts[t.club_id]||0) + 1);
+  return (clubs||[]).map(c => {
+    const members = (roster||[]).filter(m => m.club_id === c.id);
+    const avgOvr = members.length ? Math.round(members.reduce((s,m)=>s+m.ovr,0) / members.length) : 0;
+    return { ...c, memberCount: members.length, avgOvr, trophyCount: trophyCounts[c.id] || 0 };
+  });
 }
+
+async function renderClubsTab(){
+  if (state.currentClubProfileId) { await renderClubProfile(state.currentClubProfileId); return; }
+
+  const el = document.getElementById('tab-content');
+  el.innerHTML = `<div class="skeleton" style="height:220px;border-radius:16px;"></div>`;
+  const clubs = await getAllClubsWithStats();
+  const myClub = state.profile.club_id ? clubs.find(c => c.id === state.profile.club_id) : null;
+  const topClubs = [...clubs].sort((a,b) => b.avgOvr - a.avgOvr).slice(0, 6);
+
+  el.innerHTML = `
+    <h2 class="font-display" style="margin:0 0 14px;">Clubs</h2>
+
+    <h3 class="text-muted" style="font-size:13px;font-weight:700;margin:0 0 10px;">MY CLUB</h3>
+    ${myClub ? `
+      <div class="card fade-in" style="padding:18px;margin-bottom:22px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+        <div class="glow-purple" style="width:52px;height:52px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-weight:800;">${initials(myClub.name)}</div>
+        <div style="flex:1;min-width:180px;">
+          <div style="font-weight:800;font-size:16px;">${myClub.name}</div>
+          <div class="text-muted" style="font-size:12px;">Club OVR ${myClub.avgOvr} · ${myClub.memberCount} player${myClub.memberCount===1?'':'s'} · ${myClub.trophyCount} troph${myClub.trophyCount===1?'y':'ies'}</div>
+        </div>
+        <button class="btn-gold" style="padding:9px 18px;" onclick="openClubProfile('${myClub.id}')">View Club</button>
+      </div>
+    ` : `
+      <div class="card fade-in" style="padding:20px;margin-bottom:22px;text-align:center;">
+        <div style="font-weight:700;">You're a free agent</div>
+        <div class="text-muted" style="font-size:13px;margin-top:4px;">You don't currently belong to a club. Explore clubs below, then join one from Edit Profile.</div>
+      </div>
+    `}
+
+    <h3 class="text-muted" style="font-size:13px;font-weight:700;margin:0 0 10px;">TOP CLUBS</h3>
+    <div style="display:flex;gap:12px;overflow-x:auto;padding-bottom:6px;margin-bottom:22px;">
+      ${topClubs.map((c,i) => `
+        <div class="card fade-in" style="padding:16px;min-width:160px;flex-shrink:0;cursor:pointer;" onclick="openClubProfile('${c.id}')">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+            <div class="glow-purple" style="width:36px;height:36px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:12px;">${initials(c.name)}</div>
+            <span class="text-muted" style="font-size:11px;font-weight:700;">#${i+1}</span>
+          </div>
+          <div style="font-weight:700;font-size:13px;margin-top:10px;">${c.name}</div>
+          <div class="text-muted" style="font-size:11px;">${c.country||'—'}</div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;">
+            <span style="color:var(--gold);font-weight:800;font-size:14px;">${c.avgOvr} OVR</span>
+            <span class="text-muted" style="font-size:11px;">🏆 ${c.trophyCount}</span>
+          </div>
+        </div>`).join('') || `<div class="text-muted" style="font-size:13px;">No clubs yet.</div>`}
+    </div>
+
+    <h3 class="text-muted" style="font-size:13px;font-weight:700;margin:0 0 10px;">ALL CLUBS</h3>
+    <div style="display:flex;flex-direction:column;gap:8px;">
+      ${clubs.map(c => `
+        <div class="card fade-in" style="padding:14px 16px;display:flex;align-items:center;gap:12px;cursor:pointer;" onclick="openClubProfile('${c.id}')">
+          <div class="glow-purple" style="width:38px;height:38px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:12px;flex-shrink:0;">${initials(c.name)}</div>
+          <div style="flex:1;min-width:0;">
+            <div style="font-weight:700;font-size:14px;">${c.name}</div>
+            <div class="text-muted" style="font-size:11px;">${c.country||'—'} · ${c.memberCount} player${c.memberCount===1?'':'s'}</div>
+          </div>
+          <span style="color:var(--gold);font-weight:800;font-size:14px;">${c.avgOvr} OVR</span>
+        </div>`).join('') || `<div class="text-muted" style="font-size:13px;">No clubs yet.</div>`}
+    </div>
+  `;
+}
+
+const CLUB_PROFILE_TABS = ['Overview','Posts','Squad','Trophies','History'];
+
+async function openClubProfile(clubId){
+  state.currentClubProfileId = clubId;
+  state.clubProfileTab = 'Overview';
+  await renderClubProfile(clubId);
+}
+window.openClubProfile = openClubProfile;
+
+function closeClubProfile(){
+  state.currentClubProfileId = null;
+  renderClubsTab();
+}
+window.closeClubProfile = closeClubProfile;
+
+function setClubProfileTab(tab){
+  state.clubProfileTab = tab;
+  renderClubProfile(state.currentClubProfileId);
+}
+window.setClubProfileTab = setClubProfileTab;
+
+async function renderClubProfile(clubId){
+  const el = document.getElementById('tab-content');
+  el.innerHTML = `<div class="skeleton" style="height:280px;border-radius:16px;"></div>`;
+
+  const [{ data: club }, { data: roster }, { data: admins }] = await Promise.all([
+    sb.from('clubs').select('*').eq('id', clubId).single(),
+    sb.from('profiles').select('*').eq('club_id', clubId).order('ovr', { ascending:false }),
+    sb.from('club_admins').select('user_id').eq('club_id', clubId),
+  ]);
+  if (!club) { el.innerHTML = `<p class="text-muted">Club not found.</p>`; return; }
+
+  const avgOvr = roster && roster.length ? Math.round(roster.reduce((s,m)=>s+m.ovr,0) / roster.length) : 0;
+  const isAdmin = (admins||[]).some(a => a.user_id === state.user.id);
+  const tab = state.clubProfileTab || 'Overview';
+
+  el.innerHTML = `
+    <button class="btn-ghost" style="padding:6px 14px;font-size:12px;margin-bottom:14px;" onclick="closeClubProfile()">← All Clubs</button>
+
+    <div class="card fade-in" style="padding:22px;background:linear-gradient(160deg,#1c1030,#161022 55%,#0e0c18);border:1px solid #3a2a5c;margin-bottom:16px;">
+      <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+        <div class="glow-purple" style="width:68px;height:68px;border-radius:16px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:20px;flex-shrink:0;">${initials(club.name)}</div>
+        <div style="flex:1;min-width:200px;">
+          <div class="font-display" style="font-size:22px;font-weight:800;">${club.name.toUpperCase()}</div>
+          <div class="text-muted" style="font-size:13px;margin-top:2px;">${club.country||'Country unset'} · Founded ${club.founded_year||'—'}</div>
+        </div>
+        <div style="display:flex;gap:20px;">
+          <div style="text-align:center;"><div style="font-weight:800;font-size:18px;color:var(--gold);">${avgOvr}</div><div class="text-muted" style="font-size:10px;">CLUB OVR</div></div>
+          <div style="text-align:center;"><div style="font-weight:800;font-size:18px;">${roster?.length||0}</div><div class="text-muted" style="font-size:10px;">PLAYERS</div></div>
+          <div style="text-align:center;"><div style="font-weight:800;font-size:18px;">${fmtNum(club.fan_count)}</div><div class="text-muted" style="font-size:10px;">FANS</div></div>
+        </div>
+      </div>
+      <div class="text-muted" style="font-size:12px;margin-top:14px;padding-top:12px;border-top:1px solid var(--border);">Not yet registered to a league — competition standings arrive with the League system.</div>
+    </div>
+
+    <div style="display:flex;gap:18px;border-bottom:1px solid var(--border);margin-bottom:16px;overflow-x:auto;">
+      ${CLUB_PROFILE_TABS.map(t => `<button class="${tab===t?'tab-active':'tab-inactive'}" style="background:none;border:none;padding:8px 2px;font-weight:600;font-size:13px;white-space:nowrap;" onclick="setClubProfileTab('${t}')">${t}</button>`).join('')}
+    </div>
+
+    <div id="club-profile-section">${clubSectionLoading()}</div>
+  `;
+
+  if (tab === 'Overview') renderClubOverviewSection(club, roster||[], avgOvr);
+  else if (tab === 'Posts') await renderClubPostsSection(club, isAdmin);
+  else if (tab === 'Squad') renderClubSquadSection(roster||[]);
+  else if (tab === 'Trophies') await renderClubTrophiesSection(club);
+  else if (tab === 'History') await renderClubHistorySection(club, roster||[]);
+}
+
+function clubSectionLoading(){ return `<div class="skeleton" style="height:160px;border-radius:14px;"></div>`; }
+
+function renderClubOverviewSection(club, roster, avgOvr){
+  const box = document.getElementById('club-profile-section');
+  box.innerHTML = `
+    <div class="card fade-in" style="padding:20px;margin-bottom:16px;">
+      <h3 class="font-display" style="margin:0 0 14px;font-size:15px;">Club Information</h3>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;">
+        <div class="chip" style="padding:10px;"><div style="font-weight:800;font-size:16px;color:var(--gold);">${avgOvr}</div><div class="text-muted" style="font-size:10px;">CLUB OVR</div></div>
+        <div class="chip" style="padding:10px;"><div style="font-weight:800;font-size:16px;">${roster.length}</div><div class="text-muted" style="font-size:10px;">SQUAD SIZE</div></div>
+        <div class="chip" style="padding:10px;"><div style="font-weight:800;font-size:16px;">${club.founded_year||'—'}</div><div class="text-muted" style="font-size:10px;">FOUNDED</div></div>
+        <div class="chip" style="padding:10px;"><div style="font-weight:800;font-size:16px;">${fmtNum(club.fan_count)}</div><div class="text-muted" style="font-size:10px;">FANS</div></div>
+      </div>
+    </div>
+    <div class="card fade-in" style="padding:20px;">
+      <h3 class="font-display" style="margin:0 0 8px;font-size:15px;">Current Form &amp; Fixtures</h3>
+      <p class="text-muted" style="font-size:13px;margin:0;">Rival Arena matches are currently 1v1 player challenges, not club-vs-club fixtures. Club form, next fixture, and season stats will appear here once the League system introduces club competitions.</p>
+    </div>
+  `;
+}
+
+async function renderClubPostsSection(club, isAdmin){
+  const box = document.getElementById('club-profile-section');
+  const { data: posts } = await sb.from('club_posts').select('*').eq('club_id', club.id).order('created_at', { ascending:false });
+  await fetchProfilesByIds((posts||[]).map(p=>p.author_id));
+
+  box.innerHTML = `
+    ${isAdmin ? `
+      <div class="card fade-in" style="padding:16px;margin-bottom:14px;">
+        <div style="display:flex;gap:8px;margin-bottom:8px;">
+          <select class="input" id="club-post-type" style="width:auto;flex-shrink:0;">
+            ${['announcement','matchday','result','signing','celebration','player_news','media','history'].map(t=>`<option value="${t}">${t.replace('_',' ')}</option>`).join('')}
+          </select>
+          <textarea class="input" id="club-post-content" rows="2" placeholder="Post as ${club.name}…" style="resize:vertical;"></textarea>
+        </div>
+        <div style="display:flex;justify-content:flex-end;"><button class="btn-gold" onclick="createClubPost('${club.id}')">Post</button></div>
+      </div>
+    ` : ''}
+    <div style="display:flex;flex-direction:column;gap:12px;">
+      ${(posts||[]).map(p => {
+        const author = state.profilesById[p.author_id];
+        return `<div class="card fade-in" style="padding:16px;">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+            <span class="chip" style="font-size:10px;padding:2px 8px;color:var(--gold);text-transform:uppercase;">${p.post_type.replace('_',' ')}</span>
+            <span class="text-muted" style="font-size:11px;">${timeAgo(p.created_at)} · ${author?.username||'Club'}</span>
+          </div>
+          <p style="font-size:14px;margin:0;white-space:pre-wrap;">${escapeHtml(p.content)}</p>
+          ${p.image_url ? `<img src="${p.image_url}" style="width:100%;border-radius:10px;margin-top:10px;max-height:280px;object-fit:cover;"/>` : ''}
+        </div>`;
+      }).join('') || `<div class="card" style="padding:24px;text-align:center;" class="text-muted">No club posts yet.${isAdmin ? '' : ' Only club-authorized accounts can post here.'}</div>`}
+    </div>
+  `;
+}
+async function createClubPost(clubId){
+  const type = document.getElementById('club-post-type').value;
+  const content = document.getElementById('club-post-content').value.trim();
+  if (!content) { toast('Write something first', false); return; }
+  const { error } = await sb.from('club_posts').insert({ club_id: clubId, author_id: state.user.id, post_type: type, content });
+  if (error) { toast(error.message, false); return; }
+  toast('Posted to club ✅');
+  await renderClubProfile(clubId);
+}
+window.createClubPost = createClubPost;
+
+function renderClubSquadSection(roster){
+  const box = document.getElementById('club-profile-section');
+  box.innerHTML = `
+    <div class="text-muted" style="font-size:13px;font-weight:700;margin-bottom:10px;">${roster.length} PLAYER${roster.length===1?'':'S'}</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;">
+      ${roster.map(p => `
+        <div class="card fade-in" style="padding:14px;text-align:center;cursor:pointer;" onclick="openProfileModal('${p.id}')">
+          <img class="avatar" src="${avatarUrl(p)}" style="width:52px;height:52px;margin:0 auto;"/>
+          <div style="font-weight:700;font-size:13px;margin-top:8px;">${p.username}</div>
+          <div class="text-muted" style="font-size:11px;">${p.position} · ${p.country||'—'}</div>
+          <div style="color:var(--gold);font-weight:800;font-size:15px;margin-top:4px;">${p.ovr} OVR</div>
+        </div>`).join('') || `<div class="text-muted" style="font-size:13px;grid-column:1/-1;">No players in this club yet.</div>`}
+    </div>
+  `;
+}
+
+async function renderClubTrophiesSection(club){
+  const box = document.getElementById('club-profile-section');
+  const [{ data: defs }, { data: awards }] = await Promise.all([
+    sb.from('club_trophy_defs').select('*'),
+    sb.from('club_trophy_awards').select('*').eq('club_id', club.id),
+  ]);
+  const wonCodes = new Set();
+  (awards||[]).forEach(a => { const d = (defs||[]).find(x=>x.id===a.trophy_id); if (d) wonCodes.add(d.code); });
+  box.innerHTML = `
+    <div class="card fade-in" style="padding:20px;">
+      <div class="text-muted" style="font-size:12px;margin-bottom:14px;">${awards?.length||0} won</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:12px;">
+        ${(defs||[]).map(t => {
+          const won = wonCodes.has(t.code);
+          return `<div class="chip" title="${escapeHtml(t.description||'')}" style="padding:14px 8px;text-align:center;${won?'':'opacity:.3;filter:grayscale(1);'}">
+            <div style="font-size:26px;">${t.icon}</div>
+            <div style="font-size:11px;font-weight:700;margin-top:6px;">${t.name}</div>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>
+  `;
+}
+
+async function renderClubHistorySection(club, roster){
+  const box = document.getElementById('club-profile-section');
+  const { data: events } = await sb.from('club_events').select('*').eq('club_id', club.id).order('occurred_at', { ascending:true });
+  const standout = roster.length ? roster.reduce((a,b)=> b.ovr > a.ovr ? b : a) : null;
+
+  box.innerHTML = `
+    <div class="card fade-in" style="padding:20px;margin-bottom:16px;">
+      <h3 class="font-display" style="margin:0 0 14px;font-size:15px;">Club Timeline</h3>
+      <div style="display:flex;flex-direction:column;">
+        ${(events||[]).map((e,i) => `
+          <div style="display:flex;gap:12px;">
+            <div style="display:flex;flex-direction:column;align-items:center;">
+              <div style="width:10px;height:10px;border-radius:50%;background:var(--gold);border:2px solid var(--gold-2);flex-shrink:0;"></div>
+              ${i < events.length-1 ? `<div style="width:2px;flex:1;background:var(--border);min-height:20px;"></div>` : ''}
+            </div>
+            <div style="padding-bottom:16px;">
+              <div style="font-weight:700;font-size:13px;">${e.title}</div>
+              ${e.body ? `<div class="text-muted" style="font-size:12px;margin-top:2px;">${escapeHtml(e.body)}</div>` : ''}
+              <div class="text-muted" style="font-size:11px;margin-top:2px;">${new Date(e.occurred_at).toLocaleDateString(undefined,{month:'long',year:'numeric'})}</div>
+            </div>
+          </div>`).join('') || `<div class="text-muted" style="font-size:13px;">No recorded history yet.</div>`}
+      </div>
+    </div>
+
+    <div class="card fade-in" style="padding:20px;">
+      <h3 class="font-display" style="margin:0 0 4px;font-size:15px;">Club Legends &amp; Records</h3>
+      ${standout ? `<div class="chip" style="padding:12px;margin-top:10px;display:inline-flex;align-items:center;gap:10px;cursor:pointer;" onclick="openProfileModal('${standout.id}')">
+        <img class="avatar" src="${avatarUrl(standout)}" style="width:32px;height:32px;"/>
+        <div><div style="font-weight:700;font-size:13px;">${standout.username}</div><div class="text-muted" style="font-size:11px;">Current standout · ${standout.ovr} OVR</div></div>
+      </div>` : ''}
+      <p class="text-muted" style="font-size:12px;margin-top:12px;">All-time appearances, top scorers, and league/cup records need matches attributed to a club at the time they were played — that tracking arrives with the League system. This section will populate automatically once it does, and a legend stays listed here even after leaving the club.</p>
+    </div>
+  `;
+}
+
 
 /* ==========================================================================
    8. TOURNAMENTS TAB
@@ -1614,6 +1881,14 @@ function subscribeRealtime(){
     })
     .subscribe();
   state.channels.push(careerCh);
+
+  // --- clubs: posts, trophies, history — global, since clubs are shared spaces ---
+  const clubCh = sb.channel('rt-clubs')
+    .on('postgres_changes', { event:'INSERT', schema:'public', table:'club_posts' }, () => refreshIfActive(['clubs']))
+    .on('postgres_changes', { event:'INSERT', schema:'public', table:'club_trophy_awards' }, () => refreshIfActive(['clubs']))
+    .on('postgres_changes', { event:'INSERT', schema:'public', table:'club_events' }, () => refreshIfActive(['clubs']))
+    .subscribe();
+  state.channels.push(clubCh);
 
   // --- feed: posts, likes, comments (global — feed is a shared space) ---
   const feedCh = sb.channel('rt-feed')
