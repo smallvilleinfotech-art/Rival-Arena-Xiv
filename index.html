@@ -67,7 +67,11 @@
   @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
   #toast{position:fixed;bottom:90px;left:50%;transform:translateX(-50%);z-index:100;}
   @media (max-width:900px){ .sidebar{display:none;} .bottomnav{display:flex;} .maincontent{padding-bottom:90px;} }
-  @media (max-width:760px){ #tab-content > div[style*="grid-template-columns:minmax(0,520px) 1fr"]{grid-template-columns:1fr !important;} }
+  @media (max-width:640px){
+    #tab-content div[style*="grid-template-columns:1fr 1fr"]{grid-template-columns:1fr !important;}
+    #tab-content div[style*="grid-template-columns:auto 1fr"]{grid-template-columns:1fr !important;text-align:center;}
+    #tab-content div[style*="grid-template-columns:auto 1fr"] > div:last-child{text-align:left;}
+  }
   @media (min-width:901px){ .bottomnav{display:none;} }
 </style>
 </head>
@@ -710,97 +714,442 @@ window.addComment = addComment;
 /* ==========================================================================
    6. CAREER TAB
    ========================================================================== */
+/* ==========================================================================
+   6. CAREER TAB — the full career dashboard
+   ========================================================================== */
+const POSITION_NAMES = {
+  GK:'Goalkeeper', CB:'Centre Back', LB:'Left Back', RB:'Right Back',
+  CDM:'Defensive Midfielder', CM:'Central Midfielder', CAM:'Central Attacking Midfielder',
+  LW:'Left Winger', RW:'Right Winger', ST:'Striker',
+};
+const COUNTRY_FLAGS = {
+  Nigeria:'🇳🇬', 'United States':'🇺🇸', 'United Kingdom':'🇬🇧', England:'🏴󠁧󠁢󠁥󠁮󠁧󠁿', Ghana:'🇬🇭', Kenya:'🇰🇪',
+  'South Africa':'🇿🇦', Brazil:'🇧🇷', Argentina:'🇦🇷', France:'🇫🇷', Spain:'🇪🇸', Germany:'🇩🇪',
+  Portugal:'🇵🇹', Italy:'🇮🇹', Egypt:'🇪🇬', Morocco:'🇲🇦', Cameroon:'🇨🇲', India:'🇮🇳', Canada:'🇨🇦',
+};
+const ATTRIBUTE_DEFS = [
+  { key:'attack',      label:'Attack',      icon:'⚡' },
+  { key:'creation',    label:'Creation',    icon:'🎯' },
+  { key:'control',     label:'Control',     icon:'🛡️' },
+  { key:'clutch',      label:'Clutch',      icon:'🔥' },
+  { key:'consistency', label:'Consistency', icon:'📈' },
+  { key:'dominance',   label:'Dominance',   icon:'👑' },
+];
+function getArchetype(p){
+  const best = ATTRIBUTE_DEFS.reduce((a,b) => (p[b.key]||0) > (p[a.key]||0) ? b : a);
+  const map = {
+    attack:      { title:'Finisher',      desc:'Lives to put the ball in the net.' },
+    creation:    { title:'Playmaker',     desc:'Unlocks defenses with vision and passing.' },
+    control:     { title:'Technician',    desc:'Composed on the ball under any pressure.' },
+    clutch:      { title:'Rival Champion',desc:'Proven winner. Built for glory.' },
+    consistency: { title:'Metronome',     desc:'Delivers the same level, match after match.' },
+    dominance:   { title:'Enforcer',      desc:'Controls the tempo and imposes their will.' },
+  };
+  return { icon:'🏆', ...map[best.key] };
+}
+
 async function renderCareerTab(){
   const el = document.getElementById('tab-content');
   const p = state.profile;
-  const { data: clubs } = await sb.from('clubs').select('*').order('name');
-  const { followers, following } = await getFollowCounts(p.id);
-  const { data: myAch } = await sb.from('player_achievements').select('unlocked_at, achievements(*)').eq('player_id', p.id).order('unlocked_at', { ascending:false });
-  const { data: allAch } = await sb.from('achievements').select('*');
-  const unlockedCodes = new Set((myAch||[]).map(a => a.achievements?.code));
+
+  const [{ data: myAch }, { data: allAch }, { data: ovrHistory }, { data: myMatches },
+         { data: myTrophies }, { data: allTrophies }, { data: myEvents }, { data: club }] = await Promise.all([
+    sb.from('player_achievements').select('unlocked_at, achievements(*)').eq('player_id', p.id),
+    sb.from('achievements').select('*').order('threshold'),
+    sb.from('ovr_history').select('ovr, recorded_at').eq('player_id', p.id).order('recorded_at', { ascending:true }),
+    sb.from('matches').select('*').or(`player_a.eq.${p.id},player_b.eq.${p.id}`).eq('status','confirmed').order('confirmed_at', { ascending:false }).limit(10),
+    sb.from('player_trophies').select('awarded_at, trophies(*)').eq('player_id', p.id),
+    sb.from('trophies').select('*'),
+    sb.from('career_events').select('*').eq('player_id', p.id).order('occurred_at', { ascending:true }),
+    p.club_id ? sb.from('clubs').select('*').eq('id', p.club_id).single() : Promise.resolve({ data:null }),
+  ]);
+
+  await fetchProfilesByIds((myMatches||[]).flatMap(m=>[m.player_a,m.player_b]));
+  let clubAvgOvr = null;
+  if (p.club_id) {
+    const { data: roster } = await sb.from('profiles').select('ovr').eq('club_id', p.club_id);
+    if (roster && roster.length) clubAvgOvr = Math.round(roster.reduce((s,r)=>s+r.ovr,0) / roster.length);
+  }
+
   const winRate = p.matches_played > 0 ? Math.round((p.wins / p.matches_played) * 100) : 0;
+  const unlockedCodes = new Set((myAch||[]).map(a => a.achievements?.code));
+  const trophyCodesWon = new Set((myTrophies||[]).map(t => t.trophies?.code));
+  const archetype = getArchetype(p);
+  const highestOvr = Math.max(p.ovr, ...(ovrHistory||[]).map(h=>h.ovr));
 
   el.innerHTML = `
-  <div style="display:grid;grid-template-columns:minmax(0,520px) 1fr;gap:16px;align-items:start;">
-    <div class="card fade-in" style="padding:20px;">
-      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px;">
-        <h2 class="font-display" style="margin:0;">My Career</h2>
-        <span class="chip" style="padding:5px 12px;font-size:12px;color:var(--gold);font-weight:700;letter-spacing:.03em;">${p.rival_id || 'RA-PENDING'}</span>
-      </div>
+    ${renderPlayerCard(p, club, archetype)}
 
-      <div style="display:flex;align-items:center;gap:16px;margin-bottom:18px;">
-        <div style="position:relative;">
-          <img id="career-avatar-preview" class="avatar" src="${avatarUrl(p)}" style="width:76px;height:76px;border:2px solid var(--gold);"/>
-          <button onclick="triggerAvatarUpload()" title="Change photo" style="position:absolute;bottom:-4px;right:-4px;background:var(--purple);border:2px solid var(--panel);border-radius:50%;width:26px;height:26px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:13px;">📷</button>
-        </div>
-        <div>
-          <button class="btn-ghost" style="padding:7px 14px;font-size:12px;" onclick="triggerAvatarUpload()">Change Photo</button>
-          <div class="text-muted" style="font-size:11px;margin-top:6px;">JPG or PNG, up to 5MB</div>
-        </div>
+    <div class="card fade-in" style="padding:20px;margin-top:16px;">
+      <h3 class="font-display" style="margin:0 0 14px;font-size:16px;">Career Overview</h3>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px;">
+        ${[
+          ['🎮','Matches', p.matches_played],
+          ['🏆','Wins', p.wins],
+          ['🤝','Draws', p.draws],
+          ['❌','Losses', p.losses],
+          ['📊','Win Rate', winRate+'%'],
+          ['⚽','Goals', p.goals_for],
+          ['🥅','Goals Against', p.goals_against],
+          ['⭐','MVPs', p.mvp_count],
+        ].map(([icon,label,val]) => `
+          <div class="chip" style="padding:12px;text-align:center;">
+            <div style="font-size:16px;">${icon}</div>
+            <div style="font-weight:800;font-size:17px;margin-top:4px;">${val}</div>
+            <div class="text-muted" style="font-size:10px;margin-top:2px;">${label}</div>
+          </div>`).join('')}
       </div>
-
-      <div style="display:flex;gap:10px;margin-bottom:18px;">
-        <div class="chip" style="padding:8px 14px;flex:1;text-align:center;"><div style="font-weight:800;">${fmtNum(followers)}</div><div class="text-muted" style="font-size:11px;">Followers</div></div>
-        <div class="chip" style="padding:8px 14px;flex:1;text-align:center;"><div style="font-weight:800;">${fmtNum(following)}</div><div class="text-muted" style="font-size:11px;">Following</div></div>
-      </div>
-
-      <div style="display:flex;flex-direction:column;gap:12px;">
-        <div><label class="text-muted" style="font-size:12px;">Username</label><input class="input" id="edit-username" value="${p.username}" style="margin-top:4px;"/></div>
-        <div><label class="text-muted" style="font-size:12px;">Full Name</label><input class="input" id="edit-fullname" value="${p.full_name||''}" placeholder="Your real name" style="margin-top:4px;"/></div>
-        <div style="display:flex;gap:10px;">
-          <div style="flex:1;"><label class="text-muted" style="font-size:12px;">Position</label>
-            <select class="input" id="edit-position" style="margin-top:4px;">
-              ${['GK','CB','LB','RB','CDM','CM','CAM','LW','RW','ST'].map(pos=>`<option ${p.position===pos?'selected':''}>${pos}</option>`).join('')}
-            </select>
-          </div>
-          <div style="flex:1;"><label class="text-muted" style="font-size:12px;">Country</label><input class="input" id="edit-country" value="${p.country||''}" placeholder="e.g. Nigeria" style="margin-top:4px;"/></div>
-        </div>
-        <div><label class="text-muted" style="font-size:12px;">Club</label>
-          <select class="input" id="edit-club" style="margin-top:4px;">
-            <option value="">— Free Agent —</option>
-            ${(clubs||[]).map(c=>`<option value="${c.id}" ${p.club_id===c.id?'selected':''}>${c.name}</option>`).join('')}
-          </select>
-        </div>
-        <div><label class="text-muted" style="font-size:12px;">Bio</label><textarea class="input" id="edit-bio" rows="3" placeholder="Tell rivals about yourself…" style="margin-top:4px;resize:vertical;">${p.bio||''}</textarea></div>
-        <button class="btn-primary" onclick="saveCareer()">Save Changes</button>
-      </div>
-      <button class="btn-ghost" style="margin-top:20px;width:100%;" onclick="logout()">Sign Out</button>
     </div>
 
-    <div style="display:flex;flex-direction:column;gap:16px;">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px;">
       <div class="card fade-in" style="padding:20px;">
-        <h3 class="font-display" style="margin:0 0 14px;font-size:16px;">Career Statistics</h3>
-        <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px;">
-          <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">OVR</div><div style="font-weight:800;font-size:18px;color:var(--gold);">${p.ovr}</div></div>
-          <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">Global Rank</div><div style="font-weight:800;font-size:18px;">#${p.rank}</div></div>
-          <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">Fans</div><div style="font-weight:800;font-size:18px;">${fmtNum(p.fans)}</div></div>
-          <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">Market Value</div><div style="font-weight:800;font-size:18px;color:var(--green);">${fmtMoney(p.market_value)}</div></div>
-          <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">Matches</div><div style="font-weight:800;font-size:18px;">${p.matches_played}</div></div>
-          <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">Win Rate</div><div style="font-weight:800;font-size:18px;">${winRate}%</div></div>
-          <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">W / D / L</div><div style="font-weight:800;font-size:15px;"><span style="color:var(--green);">${p.wins}</span> / <span style="color:var(--muted);">${p.draws}</span> / <span style="color:var(--red);">${p.losses}</span></div></div>
-          <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">Win Streak</div><div style="font-weight:800;font-size:18px;color:#ff8a4c;">🔥 ${p.win_streak}</div></div>
-          <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">Goals For</div><div style="font-weight:800;font-size:18px;">${p.goals_for}</div></div>
-          <div class="chip" style="padding:10px;"><div class="text-muted" style="font-size:11px;">Goals Against</div><div style="font-weight:800;font-size:18px;">${p.goals_against}</div></div>
+        <h3 class="font-display" style="margin:0 0 14px;font-size:16px;">Current Form</h3>
+        ${renderFormAndMatches(p, myMatches||[])}
+      </div>
+      <div class="card fade-in" style="padding:20px;">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">
+          <h3 class="font-display" style="margin:0;font-size:16px;">OVR Progression</h3>
+          <span class="text-muted" style="font-size:11px;">Highest: ${highestOvr}</span>
+        </div>
+        ${renderOvrChart(ovrHistory||[], p.ovr)}
+      </div>
+    </div>
+
+    <div class="card fade-in" style="padding:20px;margin-top:16px;">
+      <h3 class="font-display" style="margin:0 0 4px;font-size:16px;">Tournament History</h3>
+      <div id="career-tournament-history" class="text-muted" style="font-size:13px;">Loading…</div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px;">
+      <div class="card fade-in" style="padding:20px;">
+        <h3 class="font-display" style="margin:0 0 4px;font-size:16px;">Trophy Cabinet</h3>
+        <div class="text-muted" style="font-size:12px;margin-bottom:14px;">${trophyCodesWon.size} / ${(allTrophies||[]).length} won</div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(90px,1fr));gap:10px;">
+          ${(allTrophies||[]).map(t => {
+            const won = trophyCodesWon.has(t.code);
+            return `<div class="chip" title="${escapeHtml(t.description||'')}" style="padding:10px 6px;text-align:center;${won?'':'opacity:.3;filter:grayscale(1);'}">
+              <div style="font-size:22px;">${t.icon}</div>
+              <div style="font-size:10px;font-weight:700;margin-top:4px;line-height:1.2;">${t.name}</div>
+            </div>`;
+          }).join('')}
         </div>
       </div>
 
       <div class="card fade-in" style="padding:20px;">
         <h3 class="font-display" style="margin:0 0 4px;font-size:16px;">Achievements</h3>
         <div class="text-muted" style="font-size:12px;margin-bottom:14px;">${unlockedCodes.size} / ${(allAch||[]).length} unlocked</div>
-        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(90px,1fr));gap:10px;">
-          ${(allAch||[]).map(a => {
-            const unlocked = unlockedCodes.has(a.code);
-            return `<div class="chip" title="${escapeHtml(a.description||'')}" style="padding:10px 6px;text-align:center;${unlocked?'':'opacity:.35;filter:grayscale(1);'}">
-              <div style="font-size:22px;">${a.icon}</div>
-              <div style="font-size:10px;font-weight:700;margin-top:4px;line-height:1.2;">${a.name}</div>
-            </div>`;
-          }).join('') || `<div class="text-muted" style="font-size:13px;">No achievements defined yet.</div>`}
+        ${['Career','Performance','Tournament'].map(cat => {
+          const items = (allAch||[]).filter(a=>a.category===cat);
+          if (cat === 'Tournament' && !items.length) {
+            return `<div style="margin-bottom:10px;"><div class="text-muted" style="font-size:11px;font-weight:700;margin-bottom:6px;">TOURNAMENT</div><div class="text-muted" style="font-size:12px;">Unlocks once the Tournament Engine tracks results.</div></div>`;
+          }
+          if (!items.length) return '';
+          return `<div style="margin-bottom:10px;">
+            <div class="text-muted" style="font-size:11px;font-weight:700;margin-bottom:6px;">${cat.toUpperCase()}</div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(80px,1fr));gap:8px;">
+              ${items.map(a => {
+                const unlocked = unlockedCodes.has(a.code);
+                return `<div class="chip" title="${escapeHtml(a.description||'')}" style="padding:8px 4px;text-align:center;${unlocked?'':'opacity:.3;filter:grayscale(1);'}">
+                  <div style="font-size:18px;">${a.icon}</div>
+                  <div style="font-size:9px;font-weight:700;margin-top:3px;line-height:1.2;">${a.name}</div>
+                </div>`;
+              }).join('')}
+            </div>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>
+
+    <div class="card fade-in" style="padding:20px;margin-top:16px;">
+      <h3 class="font-display" style="margin:0 0 14px;font-size:16px;">Career Records</h3>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;">
+        ${[
+          ['Highest OVR', highestOvr],
+          ['Highest Global Rank', p.best_rank && p.best_rank < 9999 ? '#'+p.best_rank : '—'],
+          ['Longest Win Streak', p.best_win_streak],
+          ['Most Goals in a Match', p.most_goals_match],
+          ['Most Goals in a Tournament', '—'],
+          ['Most Tournament Wins', trophyCodesWon.has('genesis_champion') ? [...trophyCodesWon].filter(c=>c==='genesis_champion').length : 0],
+        ].map(([label,val]) => `
+          <div class="chip" style="padding:12px;">
+            <div style="font-weight:800;font-size:16px;">${val}</div>
+            <div class="text-muted" style="font-size:11px;margin-top:2px;">${label}</div>
+          </div>`).join('')}
+      </div>
+    </div>
+
+    <div class="card fade-in" style="padding:20px;margin-top:16px;">
+      <h3 class="font-display" style="margin:0 0 14px;font-size:16px;">Career Timeline</h3>
+      ${renderTimeline(myEvents||[], p, trophyCodesWon)}
+    </div>
+
+    <div class="card fade-in" style="padding:20px;margin-top:16px;">
+      <h3 class="font-display" style="margin:0 0 14px;font-size:16px;">Current Club</h3>
+      ${club ? `
+        <div style="display:flex;align-items:center;gap:12px;">
+          <div class="glow-purple" style="width:48px;height:48px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-weight:800;">${initials(club.name)}</div>
+          <div style="flex:1;">
+            <div style="font-weight:700;font-size:15px;">${club.name}</div>
+            <div class="text-muted" style="font-size:12px;">${clubAvgOvr ? `Club OVR ${clubAvgOvr}` : ''}</div>
+          </div>
+          <button class="btn-ghost" style="padding:8px 16px;font-size:13px;" onclick="setTab('clubs')">View Club →</button>
+        </div>
+        <div class="text-muted" style="font-size:11px;margin-top:10px;">Contracts, transfer history, and previous clubs arrive with the Club &amp; Contract system.</div>
+      ` : `
+        <div class="text-muted" style="font-size:13px;">You're a free agent. Assign a club from Edit Profile to represent them in Rival Arena.</div>
+      `}
+    </div>
+
+    <div style="text-align:center;margin-top:20px;">
+      <button class="btn-ghost" onclick="openEditProfileModal()">✏️ Edit Profile</button>
+      <button class="btn-ghost" style="margin-left:8px;" onclick="logout()">Sign Out</button>
+    </div>
+  `;
+
+  loadTournamentHistory(p.id);
+}
+
+function renderPlayerCard(p, club, archetype){
+  return `
+  <div class="card fade-in" style="padding:22px;background:linear-gradient(160deg,#1c1030,#161022 55%,#0e0c18);border:1px solid #3a2a5c;">
+    <div style="display:grid;grid-template-columns:auto 1fr;gap:20px;align-items:start;">
+      <div style="position:relative;text-align:center;">
+        <img id="career-avatar-preview" src="${avatarUrl(p)}" style="width:96px;height:96px;border-radius:16px;object-fit:cover;border:2px solid #3a2a5c;"/>
+        <button onclick="triggerAvatarUpload()" title="Change photo" style="position:absolute;top:-6px;right:-6px;background:var(--panel-2);border:1px solid var(--border);border-radius:50%;width:26px;height:26px;display:flex;align-items:center;justify-content:center;font-size:12px;">✏️</button>
+        <div style="margin-top:-14px;position:relative;z-index:1;">
+          <div style="width:56px;height:56px;margin:0 auto;background:linear-gradient(160deg,var(--purple-2),var(--purple));clip-path:polygon(50% 0%,100% 20%,100% 75%,50% 100%,0% 75%,0% 20%);display:flex;flex-direction:column;align-items:center;justify-content:center;border:2px solid #0e0c18;">
+            <span style="font-weight:800;font-size:16px;line-height:1;">${p.ovr}</span>
+            <span style="font-size:8px;font-weight:700;color:var(--gold-2);letter-spacing:.05em;">OVR</span>
+          </div>
+        </div>
+      </div>
+
+      <div style="min-width:0;">
+        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+          <div style="display:flex;align-items:center;gap:8px;">
+            <span class="font-display" style="font-size:22px;font-weight:800;letter-spacing:.01em;">${p.username.toUpperCase()}</span>
+            ${p.verified?'<span style="color:var(--purple-2);">✔️</span>':''}
+          </div>
+          <span class="text-muted" style="font-size:11px;font-weight:700;">RIVAL ARENA</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap;">
+          <span class="chip" style="padding:3px 10px;font-size:11px;font-weight:800;color:var(--gold);">${p.position}</span>
+          <span class="text-muted" style="font-size:12px;">${POSITION_NAMES[p.position]||''}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;margin-top:8px;font-size:13px;">
+          <span>${COUNTRY_FLAGS[p.country]||'🌐'}</span><span>${p.country||'Unspecified'}</span>
+        </div>
+        <div style="margin-top:4px;">
+          <span class="text-muted" style="font-size:10px;font-weight:700;letter-spacing:.05em;">RIVAL ID </span>
+          <span style="color:var(--gold);font-size:12px;font-weight:700;">${p.rival_id||'—'}</span>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px;">
+          <div class="chip" style="padding:8px 12px;">
+            <div style="display:flex;align-items:center;gap:6px;font-weight:800;font-size:16px;">👑 #${p.rank}</div>
+            <div class="text-muted" style="font-size:10px;">GLOBAL RANK</div>
+          </div>
+          <div class="chip" style="padding:8px 12px;">
+            <div style="display:flex;align-items:center;gap:6px;font-weight:800;font-size:16px;color:var(--green);">📈 ${fmtMoney(p.market_value)}</div>
+            <div class="text-muted" style="font-size:10px;">MARKET VALUE</div>
+          </div>
+        </div>
+
+        ${club ? `<div class="chip" style="padding:10px 12px;margin-top:8px;display:flex;align-items:center;gap:10px;cursor:pointer;" onclick="setTab('clubs')">
+          <div class="glow-purple" style="width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:11px;">${initials(club.name)}</div>
+          <div style="flex:1;"><div style="font-weight:700;font-size:13px;">${club.name}</div><div class="text-muted" style="font-size:10px;">CURRENT CLUB</div></div>
+          <span class="text-muted">›</span>
+        </div>` : ''}
+      </div>
+    </div>
+
+    <div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border);">
+      <div class="text-muted" style="font-size:10px;font-weight:700;letter-spacing:.05em;margin-bottom:8px;">AREA OF DOMINANCE</div>
+      <div style="display:flex;align-items:center;gap:12px;">
+        <div class="glow-gold" style="width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px;">${archetype.icon}</div>
+        <div>
+          <div style="font-weight:800;font-size:14px;letter-spacing:.02em;">${archetype.title.toUpperCase()}</div>
+          <div class="text-muted" style="font-size:12px;">${archetype.desc}</div>
         </div>
       </div>
     </div>
-  </div>
+
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:16px;">
+      ${ATTRIBUTE_DEFS.map(a => `
+        <div>
+          <div style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--muted);"><span>${a.icon}</span>${a.label.toUpperCase()}</div>
+          <div style="font-weight:800;font-size:18px;margin-top:2px;">${p[a.key]}</div>
+          <div style="background:var(--panel-3);border-radius:999px;height:5px;margin-top:5px;overflow:hidden;">
+            <div style="width:${Math.min(100,p[a.key])}%;height:100%;background:linear-gradient(90deg,var(--purple),var(--purple-2));"></div>
+          </div>
+        </div>`).join('')}
+    </div>
+  </div>`;
+}
+
+function renderFormAndMatches(p, matches){
+  const form = matches.slice(0,5).reverse().map(m => {
+    const isA = m.player_a === p.id;
+    const my = isA ? m.score_a : m.score_b, rival = isA ? m.score_b : m.score_a;
+    return my>rival ? 'W' : my<rival ? 'L' : 'D';
+  });
+  const formDots = form.map(r => `<div style="width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;background:${r==='W'?'rgba(61,220,151,.18)':r==='L'?'rgba(239,74,107,.18)':'var(--panel-2)'};color:${r==='W'?'var(--green)':r==='L'?'var(--red)':'var(--muted)'};border:1px solid ${r==='W'?'var(--green)':r==='L'?'var(--red)':'var(--border)'};">${r}</div>`).join('');
+
+  const recentRows = matches.slice(0,3).map(m => {
+    const isA = m.player_a === p.id;
+    const rivalId = isA ? m.player_b : m.player_a;
+    const rivalName = state.profilesById[rivalId]?.username || 'Rival';
+    const my = isA ? m.score_a : m.score_b, rival = isA ? m.score_b : m.score_a;
+    const outcome = my>rival?'W':my<rival?'L':'D';
+    const color = outcome==='W'?'var(--green)':outcome==='L'?'var(--red)':'var(--muted)';
+    return `<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);cursor:pointer;" onclick="openMatchDetailsModal('${m.id}')">
+      <div style="font-size:13px;">vs <b>${rivalName}</b><div class="text-muted" style="font-size:11px;">1v1 Challenge</div></div>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span style="font-weight:800;font-size:13px;">${my} - ${rival}</span>
+        <span style="width:20px;height:20px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;color:${color};border:1px solid ${color};">${outcome}</span>
+      </div>
+    </div>`;
+  }).join('');
+
+  return `
+    <div style="display:flex;gap:8px;flex-wrap:wrap;">${formDots || `<span class="text-muted" style="font-size:13px;">No confirmed matches yet.</span>`}</div>
+    <div style="margin-top:10px;font-size:13px;">Current Win Streak: <b style="color:#ff8a4c;">🔥 ${p.win_streak}</b></div>
+    <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border);">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;">
+        <span class="text-muted" style="font-size:12px;font-weight:700;">RECENT MATCHES</span>
+        ${matches.length > 3 ? `<a href="#" onclick="setTab('pro');return false;" style="font-size:11px;color:var(--gold);">View All</a>` : ''}
+      </div>
+      ${recentRows || `<div class="text-muted" style="font-size:13px;padding:8px 0;">Play a challenge to build your match history.</div>`}
+    </div>
   `;
 }
+
+function renderOvrChart(history, currentOvr){
+  const points = history.length ? history : [{ ovr: currentOvr, recorded_at: new Date().toISOString() }];
+  const vals = points.map(h=>h.ovr);
+  const min = Math.min(...vals, currentOvr) - 5, max = Math.max(...vals, currentOvr) + 5;
+  const w = 260, h = 90, pad = 6;
+  const step = points.length > 1 ? (w - pad*2) / (points.length - 1) : 0;
+  const y = (v) => h - pad - ((v - min) / (max - min || 1)) * (h - pad*2);
+  const coords = points.map((pt,i) => [pad + i*step, y(pt.ovr)]);
+  const path = coords.map((c,i)=> (i===0?'M':'L')+c[0].toFixed(1)+','+c[1].toFixed(1)).join(' ');
+  const dots = coords.map(c=>`<circle cx="${c[0].toFixed(1)}" cy="${c[1].toFixed(1)}" r="2.5" fill="var(--purple-2)"/>`).join('');
+  const firstLabel = points[0] ? new Date(points[0].recorded_at).toLocaleDateString(undefined,{month:'short'}) : '';
+  const lastLabel = points[points.length-1] ? new Date(points[points.length-1].recorded_at).toLocaleDateString(undefined,{month:'short'}) : '';
+  return `
+    <svg viewBox="0 0 ${w} ${h}" style="width:100%;height:110px;overflow:visible;">
+      <path d="${path}" fill="none" stroke="var(--purple-2)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      ${dots}
+    </svg>
+    <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--muted);margin-top:2px;">
+      <span>${firstLabel}</span><span style="color:var(--gold);font-weight:700;">${currentOvr} OVR</span><span>${lastLabel}</span>
+    </div>
+  `;
+}
+
+async function loadTournamentHistory(playerId){
+  const box = document.getElementById('career-tournament-history');
+  if (!box) return;
+  const { data: entries } = await sb.from('tournament_participants').select('joined_at, tournaments(*)').eq('user_id', playerId).order('joined_at', { ascending:false });
+  if (!entries || !entries.length) {
+    box.innerHTML = `Join a tournament to start building your competitive résumé.`;
+    return;
+  }
+  box.innerHTML = `<div style="display:flex;flex-direction:column;gap:8px;margin-top:6px;">
+    ${entries.map(e => `
+      <div class="chip" style="padding:12px 14px;display:flex;justify-content:space-between;align-items:center;">
+        <div>
+          <div style="font-weight:700;font-size:13px;color:var(--text);">${e.tournaments?.name || 'Tournament'}</div>
+          <div class="text-muted" style="font-size:11px;">Joined ${new Date(e.joined_at).toLocaleDateString()}</div>
+        </div>
+        <span class="chip" style="font-size:10px;padding:2px 10px;text-transform:uppercase;color:${e.tournaments?.status==='live'?'var(--green)':e.tournaments?.status==='completed'?'var(--muted)':'var(--gold)'};">${e.tournaments?.status||'—'}</span>
+      </div>`).join('')}
+    <div class="text-muted" style="font-size:11px;margin-top:2px;">Per-tournament results and stats connect once the Tournament Engine tracks match outcomes.</div>
+  </div>`;
+}
+
+function renderTimeline(events, p, trophyCodesWon){
+  const items = events.map(e => ({ title: e.title, body: e.body, date: e.occurred_at, future: false }));
+  if (!trophyCodesWon.has('genesis_champion')) items.push({ title:'Win your first tournament', body:null, date:null, future:true });
+  if (p.rank !== 1) items.push({ title:'Reach global rank #1', body:null, date:null, future:true });
+
+  return `<div style="display:flex;flex-direction:column;">
+    ${items.map((it,i) => `
+      <div style="display:flex;gap:12px;">
+        <div style="display:flex;flex-direction:column;align-items:center;">
+          <div style="width:10px;height:10px;border-radius:50%;background:${it.future?'var(--panel-3)':'var(--gold)'};border:2px solid ${it.future?'var(--border)':'var(--gold-2)'};flex-shrink:0;"></div>
+          ${i < items.length-1 ? `<div style="width:2px;flex:1;background:var(--border);min-height:24px;"></div>` : ''}
+        </div>
+        <div style="padding-bottom:18px;">
+          <div style="font-weight:700;font-size:13px;${it.future?'color:var(--muted);':''}">${it.title}</div>
+          ${it.body ? `<div class="text-muted" style="font-size:12px;margin-top:2px;">${escapeHtml(it.body)}</div>` : ''}
+          <div class="text-muted" style="font-size:11px;margin-top:2px;">${it.date ? new Date(it.date).toLocaleDateString(undefined,{month:'long',year:'numeric'}) : 'Future'}</div>
+        </div>
+      </div>`).join('')}
+  </div>`;
+}
+
+/* ---- Match details modal (reuses the generic profile-modal overlay) ---- */
+async function openMatchDetailsModal(matchId){
+  const modal = document.getElementById('profile-modal');
+  const body = document.getElementById('profile-modal-body');
+  modal.style.display = 'flex';
+  body.innerHTML = `<div class="skeleton" style="height:180px;border-radius:14px;"></div>`;
+  const { data: m } = await sb.from('matches').select('*').eq('id', matchId).single();
+  if (!m) { body.innerHTML = `<p class="text-muted">Match not found.</p>`; return; }
+  await fetchProfilesByIds([m.player_a, m.player_b]);
+  const a = state.profilesById[m.player_a], b = state.profilesById[m.player_b];
+  body.innerHTML = `
+    <div style="display:flex;justify-content:flex-end;"><button onclick="closeProfileModal()" style="background:none;border:none;color:var(--muted);font-size:20px;line-height:1;">✕</button></div>
+    <div class="text-muted" style="text-align:center;font-size:11px;font-weight:700;letter-spacing:.05em;margin-bottom:6px;">1V1 CHALLENGE • ${new Date(m.confirmed_at||m.created_at).toLocaleDateString()}</div>
+    <div style="display:flex;align-items:center;justify-content:center;gap:18px;margin:14px 0;">
+      <div style="text-align:center;"><img class="avatar" src="${avatarUrl(a)}" style="width:56px;height:56px;"/><div style="font-weight:700;font-size:13px;margin-top:6px;">${a?.username||'—'}</div></div>
+      <div style="font-weight:800;font-size:26px;">${m.score_a ?? '-'} : ${m.score_b ?? '-'}</div>
+      <div style="text-align:center;"><img class="avatar" src="${avatarUrl(b)}" style="width:56px;height:56px;"/><div style="font-weight:700;font-size:13px;margin-top:6px;">${b?.username||'—'}</div></div>
+    </div>
+    ${m.wager_coins > 0 ? `<div class="text-muted" style="text-align:center;font-size:12px;">Wager: ${fmtNum(m.wager_coins)} coins</div>` : ''}
+    <div class="text-muted" style="text-align:center;font-size:11px;margin-top:8px;text-transform:capitalize;">Status: ${m.status.replace('_',' ')}</div>
+  `;
+}
+window.openMatchDetailsModal = openMatchDetailsModal;
+
+/* ---- Edit Profile modal (moved off the main dashboard) ---- */
+async function openEditProfileModal(){
+  const modal = document.getElementById('profile-modal');
+  const body = document.getElementById('profile-modal-body');
+  const p = state.profile;
+  const { data: clubs } = await sb.from('clubs').select('*').order('name');
+  modal.style.display = 'flex';
+  body.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+      <h3 class="font-display" style="margin:0;font-size:17px;">Edit Profile</h3>
+      <button onclick="closeProfileModal()" style="background:none;border:none;color:var(--muted);font-size:20px;line-height:1;">✕</button>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:12px;">
+      <div><label class="text-muted" style="font-size:12px;">Username</label><input class="input" id="edit-username" value="${p.username}" style="margin-top:4px;"/></div>
+      <div><label class="text-muted" style="font-size:12px;">Full Name</label><input class="input" id="edit-fullname" value="${p.full_name||''}" placeholder="Your real name" style="margin-top:4px;"/></div>
+      <div style="display:flex;gap:10px;">
+        <div style="flex:1;"><label class="text-muted" style="font-size:12px;">Position</label>
+          <select class="input" id="edit-position" style="margin-top:4px;">
+            ${['GK','CB','LB','RB','CDM','CM','CAM','LW','RW','ST'].map(pos=>`<option ${p.position===pos?'selected':''}>${pos}</option>`).join('')}
+          </select>
+        </div>
+        <div style="flex:1;"><label class="text-muted" style="font-size:12px;">Country</label><input class="input" id="edit-country" value="${p.country||''}" placeholder="e.g. Nigeria" style="margin-top:4px;"/></div>
+      </div>
+      <div><label class="text-muted" style="font-size:12px;">Club</label>
+        <select class="input" id="edit-club" style="margin-top:4px;">
+          <option value="">— Free Agent —</option>
+          ${(clubs||[]).map(c=>`<option value="${c.id}" ${p.club_id===c.id?'selected':''}>${c.name}</option>`).join('')}
+        </select>
+      </div>
+      <div><label class="text-muted" style="font-size:12px;">Bio</label><textarea class="input" id="edit-bio" rows="3" placeholder="Tell rivals about yourself…" style="margin-top:4px;resize:vertical;">${p.bio||''}</textarea></div>
+      <button class="btn-ghost" style="padding:9px;" onclick="triggerAvatarUpload()">📷 Change Photo</button>
+      <button class="btn-primary" onclick="saveCareer()">Save Changes</button>
+    </div>
+  `;
+}
+window.openEditProfileModal = openEditProfileModal;
+
 async function saveCareer(){
   const updates = {
     username: document.getElementById('edit-username').value.trim(),
@@ -810,11 +1159,18 @@ async function saveCareer(){
     club_id: document.getElementById('edit-club').value || null,
     bio: document.getElementById('edit-bio').value.trim(),
   };
+  const clubChanged = updates.club_id !== state.profile.club_id;
   const { data, error } = await sb.from('profiles').update(updates).eq('id', state.user.id).select().single();
   if (error) { toast(error.message, false); return; }
   state.profile = data; state.profilesById[data.id] = data;
   renderProfileBar();
+  closeProfileModal();
   toast('Career updated ✅');
+  if (clubChanged && updates.club_id) {
+    const club = (await sb.from('clubs').select('name').eq('id', updates.club_id).single()).data;
+    await sb.from('career_events').insert({ player_id: state.user.id, event_type:'club_signing', title:`Signed with ${club?.name||'a club'}`, body:null });
+  }
+  if (state.activeTab === 'career') await renderCareerTab();
 }
 window.saveCareer = saveCareer;
 
@@ -1243,6 +1599,21 @@ function subscribeRealtime(){
     })
     .subscribe();
   state.channels.push(achCh);
+
+  // --- career dashboard: OVR history, timeline events, trophies ---
+  const careerCh = sb.channel('rt-career')
+    .on('postgres_changes', { event:'INSERT', schema:'public', table:'ovr_history', filter:`player_id=eq.${state.user.id}` }, () => refreshIfActive(['career']))
+    .on('postgres_changes', { event:'INSERT', schema:'public', table:'career_events', filter:`player_id=eq.${state.user.id}` }, (payload) => {
+      toast(`📌 ${payload.new.title}`);
+      refreshIfActive(['career']);
+    })
+    .on('postgres_changes', { event:'INSERT', schema:'public', table:'player_trophies', filter:`player_id=eq.${state.user.id}` }, async (payload) => {
+      const { data: t } = await sb.from('trophies').select('*').eq('id', payload.new.trophy_id).single();
+      if (t) toast(`🏆 Trophy earned: ${t.name}`);
+      refreshIfActive(['career']);
+    })
+    .subscribe();
+  state.channels.push(careerCh);
 
   // --- feed: posts, likes, comments (global — feed is a shared space) ---
   const feedCh = sb.channel('rt-feed')
