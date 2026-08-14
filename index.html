@@ -204,6 +204,9 @@ const state = {
   followingIds: new Set(),   // ids of players the current user follows
   currentClubProfileId: null, // set when viewing a specific club's profile within the Clubs tab
   clubProfileTab: 'Overview', // Overview | Posts | Squad | Trophies | History
+  currentCompetitionId: null, // set when viewing a specific competition within the League tab
+  leagueProfileTab: 'Overview', // Overview | Table | Fixtures | Results | Stats | History
+  clubsById: {},
   followerCounts: {},        // cache: profileId -> follower count
   followingCounts: {},       // cache: profileId -> following count
   channels: [],               // active Supabase Realtime channels
@@ -213,6 +216,7 @@ const ICONS = {
   feed:'<path d="M4 12l8-8 8 8M6 10v10h4v-6h4v6h4V10"/>',
   career:'<circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 4-6 8-6s8 2 8 6"/>',
   clubs:'<path d="M12 2l2 5 5 .5-4 3.5 1.2 5-4.2-3-4.2 3 1.2-5-4-3.5 5-.5z"/>',
+  league:'<path d="M12 2l7 3.2v5.3c0 5-3 9-7 11-4-2-7-6-7-11V5.2z"/><path d="M9 12l2 2 4-4"/>',
   tournaments:'<path d="M8 21h8M12 17v4M6 4h12v3a6 6 0 01-12 0V4z"/><path d="M6 5H3v2a3 3 0 003 3M18 5h3v2a3 3 0 01-3 3"/>',
   rankings:'<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
   pro:'<path d="M14.5 3l-11 11 3.5 3.5 11-11zM3 21l4-1-3-3zM17 2l5 5-2 2-5-5z"/>',
@@ -259,6 +263,7 @@ const NAV_ITEMS = [
   {id:'feed', label:'Feed', icon:'feed'},
   {id:'career', label:'Career', icon:'career'},
   {id:'clubs', label:'Clubs', icon:'clubs'},
+  {id:'league', label:'League', icon:'league'},
   {id:'tournaments', label:'Tournaments', icon:'tournaments'},
   {id:'rankings', label:'Rankings', icon:'rankings'},
   {id:'pro', label:'Pro Players', icon:'pro', sub:'1v1'},
@@ -296,11 +301,12 @@ function renderBottomNav(){
 async function setTab(id){
   state.activeTab = id;
   if (id === 'clubs') state.currentClubProfileId = null; // fresh nav always lands on Club Home
+  if (id === 'league') state.currentCompetitionId = null; // fresh nav always lands on League Home
   renderSidebar(); renderBottomNav();
   const el = document.getElementById('tab-content');
   el.innerHTML = `<div class="skeleton" style="height:220px;border-radius:16px;"></div>`;
   const renderers = {
-    feed: renderFeedTab, career: renderCareerTab, clubs: renderClubsTab,
+    feed: renderFeedTab, career: renderCareerTab, clubs: renderClubsTab, league: renderLeagueTab,
     tournaments: renderTournamentsTab, rankings: renderRankingsTab,
     pro: renderProPlayersTab, shop: renderShopTab, inbox: renderInboxTab,
   };
@@ -1294,6 +1300,7 @@ async function renderClubProfile(clubId){
   const avgOvr = roster && roster.length ? Math.round(roster.reduce((s,m)=>s+m.ovr,0) / roster.length) : 0;
   const isAdmin = (admins||[]).some(a => a.user_id === state.user.id);
   const tab = state.clubProfileTab || 'Overview';
+  const leagueStatus = await getClubLeagueStatus(club.id);
 
   el.innerHTML = `
     <button class="btn-ghost" style="padding:6px 14px;font-size:12px;margin-bottom:14px;" onclick="closeClubProfile()">← All Clubs</button>
@@ -1311,7 +1318,11 @@ async function renderClubProfile(clubId){
           <div style="text-align:center;"><div style="font-weight:800;font-size:18px;">${fmtNum(club.fan_count)}</div><div class="text-muted" style="font-size:10px;">FANS</div></div>
         </div>
       </div>
-      <div class="text-muted" style="font-size:12px;margin-top:14px;padding-top:12px;border-top:1px solid var(--border);">Not yet registered to a league — competition standings arrive with the League system.</div>
+      <div style="font-size:12px;margin-top:14px;padding-top:12px;border-top:1px solid var(--border);">
+        ${leagueStatus
+          ? `<span class="text-muted">Competing in </span><span style="color:var(--gold);font-weight:700;cursor:pointer;" onclick="goToLeagueFromClub('${leagueStatus.competition.id}')">${leagueStatus.competition.name}</span><span class="text-muted"> · ${leagueStatus.seasonLabel} · Position #${leagueStatus.position} of ${leagueStatus.total}</span>`
+          : `<span class="text-muted">Not yet registered to a competition.</span>`}
+      </div>
     </div>
 
     <div style="display:flex;gap:18px;border-bottom:1px solid var(--border);margin-bottom:16px;overflow-x:auto;">
@@ -1321,7 +1332,7 @@ async function renderClubProfile(clubId){
     <div id="club-profile-section">${clubSectionLoading()}</div>
   `;
 
-  if (tab === 'Overview') renderClubOverviewSection(club, roster||[], avgOvr);
+  if (tab === 'Overview') await renderClubOverviewSection(club, roster||[], avgOvr);
   else if (tab === 'Posts') await renderClubPostsSection(club, isAdmin);
   else if (tab === 'Squad') renderClubSquadSection(roster||[]);
   else if (tab === 'Trophies') await renderClubTrophiesSection(club);
@@ -1330,8 +1341,38 @@ async function renderClubProfile(clubId){
 
 function clubSectionLoading(){ return `<div class="skeleton" style="height:160px;border-radius:14px;"></div>`; }
 
-function renderClubOverviewSection(club, roster, avgOvr){
+async function renderClubOverviewSection(club, roster, avgOvr){
   const box = document.getElementById('club-profile-section');
+  const leagueStatus = await getClubLeagueStatus(club.id);
+  let recentFixturesHtml = `<p class="text-muted" style="font-size:13px;margin:0;">This club hasn't been registered to a competition yet.</p>`;
+
+  if (leagueStatus) {
+    const { data: fixtures } = await sb.from('club_fixtures').select('*').or(`home_club_id.eq.${club.id},away_club_id.eq.${club.id}`).order('matchday');
+    await fetchProfilesForClubs((fixtures||[]).flatMap(f=>[f.home_club_id,f.away_club_id]));
+    const completed = (fixtures||[]).filter(f=>f.status==='completed');
+    const upcoming = (fixtures||[]).filter(f=>f.status==='scheduled').sort((a,b)=>new Date(a.kickoff_at)-new Date(b.kickoff_at));
+    const form = completed.slice(-5).map(f => {
+      const isHome = f.home_club_id === club.id;
+      const my = isHome ? f.score_home : f.score_away, opp = isHome ? f.score_away : f.score_home;
+      return my>opp?'W':my<opp?'L':'D';
+    });
+    const formDots = form.map(r => `<span style="width:26px;height:26px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-weight:800;font-size:11px;background:${r==='W'?'rgba(61,220,151,.18)':r==='L'?'rgba(239,74,107,.18)':'var(--panel-2)'};color:${r==='W'?'var(--green)':r==='L'?'var(--red)':'var(--muted)'};">${r}</span>`).join(' ');
+
+    recentFixturesHtml = `
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+        <div>
+          <span class="chip" style="padding:5px 12px;font-size:12px;cursor:pointer;" onclick="goToLeagueFromClub('${leagueStatus.competition.id}')">${leagueStatus.competition.name} · ${leagueStatus.seasonLabel}</span>
+          <div class="text-muted" style="font-size:12px;margin-top:6px;">Position #${leagueStatus.position} of ${leagueStatus.total}</div>
+        </div>
+        <div>${formDots || `<span class="text-muted" style="font-size:12px;">No matches played yet</span>`}</div>
+      </div>
+      ${upcoming[0] ? `<div class="chip" style="padding:10px 14px;margin-top:14px;cursor:pointer;" onclick="openFixtureModal('${upcoming[0].id}')">
+        <div class="text-muted" style="font-size:10px;">NEXT FIXTURE · MATCHDAY ${upcoming[0].matchday}</div>
+        <div style="font-weight:700;font-size:13px;margin-top:2px;">${state.clubsById[upcoming[0].home_club_id]?.name} vs ${state.clubsById[upcoming[0].away_club_id]?.name}</div>
+      </div>` : ''}
+    `;
+  }
+
   box.innerHTML = `
     <div class="card fade-in" style="padding:20px;margin-bottom:16px;">
       <h3 class="font-display" style="margin:0 0 14px;font-size:15px;">Club Information</h3>
@@ -1344,7 +1385,7 @@ function renderClubOverviewSection(club, roster, avgOvr){
     </div>
     <div class="card fade-in" style="padding:20px;">
       <h3 class="font-display" style="margin:0 0 8px;font-size:15px;">Current Form &amp; Fixtures</h3>
-      <p class="text-muted" style="font-size:13px;margin:0;">Rival Arena matches are currently 1v1 player challenges, not club-vs-club fixtures. Club form, next fixture, and season stats will appear here once the League system introduces club competitions.</p>
+      ${recentFixturesHtml}
     </div>
   `;
 }
@@ -1462,14 +1503,403 @@ async function renderClubHistorySection(club, roster){
         <img class="avatar" src="${avatarUrl(standout)}" style="width:32px;height:32px;"/>
         <div><div style="font-weight:700;font-size:13px;">${standout.username}</div><div class="text-muted" style="font-size:11px;">Current standout · ${standout.ovr} OVR</div></div>
       </div>` : ''}
-      <p class="text-muted" style="font-size:12px;margin-top:12px;">All-time appearances, top scorers, and league/cup records need matches attributed to a club at the time they were played — that tracking arrives with the League system. This section will populate automatically once it does, and a legend stays listed here even after leaving the club.</p>
+      <p class="text-muted" style="font-size:12px;margin-top:12px;">All-time appearances, top scorers, and league/cup records need matches attributed to a club at the time they were played — that tracking arrives with a future season-history layer. This section will populate automatically once it does, and a legend stays listed here even after leaving the club.</p>
     </div>
   `;
 }
 
 
 /* ==========================================================================
-   8. TOURNAMENTS TAB
+   8. LEAGUE SYSTEM — competitions, seasons, standings, fixtures, results
+   ========================================================================== */
+
+// Standings are never stored — always computed live from real completed
+// fixtures, so there is nothing that can drift out of sync with results.
+function computeStandings(clubs, fixtures){
+  const table = {};
+  clubs.forEach(c => { table[c.id] = { club: c, played:0, wins:0, draws:0, losses:0, gf:0, ga:0, pts:0 }; });
+  fixtures.filter(f => f.status === 'completed').forEach(f => {
+    const h = table[f.home_club_id], a = table[f.away_club_id];
+    if (!h || !a) return;
+    h.played++; a.played++;
+    h.gf += f.score_home; h.ga += f.score_away;
+    a.gf += f.score_away; a.ga += f.score_home;
+    if (f.score_home > f.score_away) { h.wins++; h.pts += 3; a.losses++; }
+    else if (f.score_home < f.score_away) { a.wins++; a.pts += 3; h.losses++; }
+    else { h.draws++; a.draws++; h.pts += 1; a.pts += 1; }
+  });
+  return Object.values(table).sort((x,y) => y.pts - x.pts || (y.gf-y.ga) - (x.gf-x.ga) || y.gf - x.gf);
+}
+
+async function getActiveSeasonFor(competitionId){
+  const { data } = await sb.from('seasons').select('*').eq('competition_id', competitionId).eq('status','active').order('started_at', { ascending:false }).limit(1).maybeSingle();
+  return data;
+}
+
+// Used by the Club Overview to show real league registration + position (League ↔ Club link)
+async function getClubLeagueStatus(clubId){
+  const { data: reg } = await sb.from('competition_clubs').select('season_id, seasons(*, competitions(*))').eq('club_id', clubId).limit(1).maybeSingle();
+  if (!reg || !reg.seasons) return null;
+  const competition = reg.seasons.competitions;
+  const { data: clubRows } = await sb.from('competition_clubs').select('club_id').eq('season_id', reg.season_id);
+  const clubIds = (clubRows||[]).map(r=>r.club_id);
+  const { data: clubs } = await sb.from('clubs').select('*').in('id', clubIds);
+  const { data: fixtures } = await sb.from('club_fixtures').select('*').eq('season_id', reg.season_id);
+  const standings = computeStandings(clubs||[], fixtures||[]);
+  const position = standings.findIndex(r => r.club.id === clubId) + 1;
+  return { competition, seasonLabel: reg.seasons.label, position, total: standings.length };
+}
+
+async function renderLeagueTab(){
+  if (state.currentCompetitionId) { await renderCompetitionProfile(state.currentCompetitionId); return; }
+
+  const el = document.getElementById('tab-content');
+  el.innerHTML = `<div class="skeleton" style="height:260px;border-radius:16px;"></div>`;
+  const { data: competitions } = await sb.from('competitions').select('*').order('type').order('name');
+  const domestic = (competitions||[]).filter(c => c.type === 'domestic');
+  const continental = (competitions||[]).filter(c => c.type === 'continental');
+
+  async function previewFor(comp){
+    const season = await getActiveSeasonFor(comp.id);
+    if (!season) return { comp, season:null, top:[] };
+    const { data: clubRows } = await sb.from('competition_clubs').select('club_id').eq('season_id', season.id);
+    const clubIds = (clubRows||[]).map(r=>r.club_id);
+    const { data: clubs } = clubIds.length ? await sb.from('clubs').select('*').in('id', clubIds) : { data: [] };
+    const { data: fixtures } = await sb.from('club_fixtures').select('*').eq('season_id', season.id);
+    const standings = computeStandings(clubs||[], fixtures||[]);
+    return { comp, season, top: standings.slice(0,3) };
+  }
+
+  const domesticPreviews = await Promise.all(domestic.map(previewFor));
+  const clPreview = continental[0] ? await previewFor(continental[0]) : null;
+
+  const leagueCard = (p) => `
+    <div class="card fade-in" style="padding:18px;cursor:pointer;" onclick="openCompetitionProfile('${p.comp.id}')">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+        <div>
+          <div style="font-weight:800;font-size:15px;">${p.comp.name}</div>
+          <div class="text-muted" style="font-size:11px;">${p.comp.country||'International'} · ${p.season?.label || 'No active season'}</div>
+        </div>
+        <span style="color:var(--gold);">›</span>
+      </div>
+      <div style="margin-top:12px;display:flex;flex-direction:column;gap:5px;">
+        ${p.top.length ? p.top.map((row,i) => `
+          <div style="display:flex;justify-content:space-between;font-size:12px;">
+            <span>${i+1}. ${row.club.name}</span>
+            <span class="text-muted">${row.pts} pts</span>
+          </div>`).join('') : `<div class="text-muted" style="font-size:12px;">No clubs registered yet.</div>`}
+      </div>
+    </div>`;
+
+  el.innerHTML = `
+    <h2 class="font-display" style="margin:0 0 14px;">League</h2>
+
+    <h3 class="text-muted" style="font-size:13px;font-weight:700;margin:0 0 10px;">DOMESTIC LEAGUES</h3>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-bottom:24px;">
+      ${domesticPreviews.map(leagueCard).join('')}
+    </div>
+
+    <h3 class="text-muted" style="font-size:13px;font-weight:700;margin:0 0 10px;">CONTINENTAL</h3>
+    ${clPreview ? leagueCard(clPreview) : `<div class="text-muted" style="font-size:13px;">No continental competition configured.</div>`}
+  `;
+}
+
+const LEAGUE_PROFILE_TABS = ['Overview','Table','Fixtures','Results','Stats','History'];
+
+async function openCompetitionProfile(competitionId){
+  state.currentCompetitionId = competitionId;
+  state.leagueProfileTab = 'Overview';
+  await renderCompetitionProfile(competitionId);
+}
+window.openCompetitionProfile = openCompetitionProfile;
+
+function closeCompetitionProfile(){
+  state.currentCompetitionId = null;
+  renderLeagueTab();
+}
+window.closeCompetitionProfile = closeCompetitionProfile;
+
+function setLeagueProfileTab(tab){
+  state.leagueProfileTab = tab;
+  renderCompetitionProfile(state.currentCompetitionId);
+}
+window.setLeagueProfileTab = setLeagueProfileTab;
+
+async function goToClubFromLeague(clubId){
+  state.activeTab = 'clubs';
+  renderSidebar(); renderBottomNav();
+  await openClubProfile(clubId);
+}
+window.goToClubFromLeague = goToClubFromLeague;
+
+async function goToLeagueFromClub(competitionId){
+  state.activeTab = 'league';
+  renderSidebar(); renderBottomNav();
+  await openCompetitionProfile(competitionId);
+}
+window.goToLeagueFromClub = goToLeagueFromClub;
+
+async function renderCompetitionProfile(competitionId){
+  const el = document.getElementById('tab-content');
+  el.innerHTML = `<div class="skeleton" style="height:280px;border-radius:16px;"></div>`;
+
+  const { data: comp } = await sb.from('competitions').select('*').eq('id', competitionId).single();
+  if (!comp) { el.innerHTML = `<p class="text-muted">Competition not found.</p>`; return; }
+  const season = await getActiveSeasonFor(comp.id);
+
+  let clubs = [], fixtures = [], standings = [];
+  if (season) {
+    const { data: clubRows } = await sb.from('competition_clubs').select('club_id').eq('season_id', season.id);
+    const clubIds = (clubRows||[]).map(r=>r.club_id);
+    const res = clubIds.length ? await sb.from('clubs').select('*').in('id', clubIds) : { data: [] };
+    clubs = res.data || [];
+    const fx = await sb.from('club_fixtures').select('*').eq('season_id', season.id).order('matchday');
+    fixtures = fx.data || [];
+    standings = computeStandings(clubs, fixtures);
+  }
+
+  const tab = state.leagueProfileTab || 'Overview';
+  const leader = standings[0];
+
+  el.innerHTML = `
+    <button class="btn-ghost" style="padding:6px 14px;font-size:12px;margin-bottom:14px;" onclick="closeCompetitionProfile()">← League Home</button>
+
+    <div class="card fade-in" style="padding:22px;background:linear-gradient(160deg,#1c1030,#161022 55%,#0e0c18);border:1px solid #3a2a5c;margin-bottom:16px;">
+      <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+        <div class="glow-gold" style="width:56px;height:56px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:24px;flex-shrink:0;">${comp.icon}</div>
+        <div style="flex:1;min-width:200px;">
+          <div class="font-display" style="font-size:20px;font-weight:800;">${comp.name.toUpperCase()}</div>
+          <div class="text-muted" style="font-size:13px;margin-top:2px;">${comp.country||'International'} · ${season?.label || 'No active season'} · ${comp.format==='league'?'League':'Group + Knockout'}</div>
+        </div>
+        ${leader ? `<div style="text-align:center;">
+          <div class="text-muted" style="font-size:10px;">CURRENT LEADER</div>
+          <div style="font-weight:800;font-size:14px;color:var(--gold);cursor:pointer;" onclick="goToClubFromLeague('${leader.club.id}')">${leader.club.name}</div>
+        </div>` : ''}
+      </div>
+    </div>
+
+    <div style="display:flex;gap:18px;border-bottom:1px solid var(--border);margin-bottom:16px;overflow-x:auto;">
+      ${LEAGUE_PROFILE_TABS.map(t => `<button class="${tab===t?'tab-active':'tab-inactive'}" style="background:none;border:none;padding:8px 2px;font-weight:600;font-size:13px;white-space:nowrap;" onclick="setLeagueProfileTab('${t}')">${t}</button>`).join('')}
+    </div>
+
+    <div id="league-profile-section">${clubSectionLoading()}</div>
+  `;
+
+  if (!season) {
+    document.getElementById('league-profile-section').innerHTML = `<div class="card" style="padding:24px;text-align:center;" class="text-muted">No active season yet for this competition.</div>`;
+    return;
+  }
+  if (comp.format !== 'league') {
+    document.getElementById('league-profile-section').innerHTML = `<div class="card" style="padding:24px;text-align:center;"><div class="text-muted" style="font-size:13px;">${comp.name} uses a group-and-knockout format. Group assignment and bracket tracking aren't built yet — this competition currently exists as a real, registered competition with no fabricated groups or results.</div></div>`;
+    return;
+  }
+
+  if (tab === 'Overview') renderLeagueOverviewSection(comp, season, standings, fixtures);
+  else if (tab === 'Table') renderLeagueTableSection(standings);
+  else if (tab === 'Fixtures') await renderLeagueFixturesSection(fixtures, false);
+  else if (tab === 'Results') await renderLeagueFixturesSection(fixtures, true);
+  else if (tab === 'Stats') renderLeagueStatsSection(standings, fixtures, clubs);
+  else if (tab === 'History') await renderLeagueHistorySection(comp);
+}
+
+function leagueClubRow(c){
+  return `<span style="cursor:pointer;" onclick="goToClubFromLeague('${c.id}')">${c.name}</span>`;
+}
+
+function renderLeagueOverviewSection(comp, season, standings, fixtures){
+  const box = document.getElementById('league-profile-section');
+  const clubById = {};
+  standings.forEach(r => { clubById[r.club.id] = r.club; });
+  const completed = fixtures.filter(f=>f.status==='completed');
+  const upcoming = fixtures.filter(f=>f.status==='scheduled').sort((a,b)=> new Date(a.kickoff_at)-new Date(b.kickoff_at));
+  const currentMatchday = upcoming.length ? upcoming[0].matchday : (fixtures.length ? Math.max(...fixtures.map(f=>f.matchday||0)) : null);
+  const n = standings.length;
+  const qualifyCount = Math.max(1, Math.ceil(n / 4));
+  const relegateCount = n > 4 ? Math.floor(n / 5) : 0;
+  const myClubId = state.profile.club_id;
+
+  box.innerHTML = `
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
+      <div class="card fade-in" style="padding:18px;">
+        <div class="text-muted" style="font-size:11px;font-weight:700;">CURRENT LEADER</div>
+        ${standings[0] ? `<div style="font-weight:800;font-size:16px;margin-top:4px;">${leagueClubRow(standings[0].club)}</div><div class="text-muted" style="font-size:12px;">${standings[0].pts} points</div>` : `<div class="text-muted" style="font-size:13px;margin-top:4px;">No standings yet.</div>`}
+      </div>
+      <div class="card fade-in" style="padding:18px;">
+        <div class="text-muted" style="font-size:11px;font-weight:700;">MATCHDAY</div>
+        <div style="font-weight:800;font-size:16px;margin-top:4px;">${currentMatchday ? 'Matchday ' + currentMatchday : '—'}</div>
+        <div class="text-muted" style="font-size:12px;">${completed.length} of ${fixtures.length} played</div>
+      </div>
+    </div>
+
+    <div class="card fade-in" style="padding:18px;margin-bottom:16px;">
+      <div class="text-muted" style="font-size:11px;font-weight:700;margin-bottom:10px;">TITLE RACE</div>
+      ${standings.slice(0,3).map((r,i)=>`<div style="display:flex;justify-content:space-between;font-size:13px;padding:5px 0;${r.club.id===myClubId?'color:var(--gold);font-weight:700;':''}">${i+1}. ${leagueClubRow(r.club)}<span>${r.pts} pts</span></div>`).join('') || `<div class="text-muted" style="font-size:13px;">Standings will appear once matches are completed.</div>`}
+      ${qualifyCount||relegateCount ? `<div class="text-muted" style="font-size:11px;margin-top:10px;">Top ${qualifyCount} qualify for continental competition · ${relegateCount ? `Bottom ${relegateCount} face relegation` : 'No relegation at this size'}</div>` : ''}
+    </div>
+
+    <div class="card fade-in" style="padding:18px;">
+      <div class="text-muted" style="font-size:11px;font-weight:700;margin-bottom:8px;">NEXT FIXTURE</div>
+      ${upcoming[0] ? `<div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;" onclick="openFixtureModal('${upcoming[0].id}')">
+        <span style="font-size:13px;">${leagueClubRow(clubById[upcoming[0].home_club_id] || {id:upcoming[0].home_club_id,name:'—'})}</span>
+        <span class="text-muted" style="font-size:11px;">vs</span>
+        <span style="font-size:13px;">${leagueClubRow(clubById[upcoming[0].away_club_id] || {id:upcoming[0].away_club_id,name:'—'})}</span>
+      </div>` : `<div class="text-muted" style="font-size:13px;">No upcoming fixtures scheduled.</div>`}
+    </div>
+  `;
+}
+
+function renderLeagueTableSection(standings){
+  const box = document.getElementById('league-profile-section');
+  const myClubId = state.profile.club_id;
+  box.innerHTML = `
+    <div class="card fade-in" style="overflow-x:auto;">
+      <table style="width:100%;border-collapse:collapse;font-size:13px;min-width:520px;">
+        <thead><tr style="text-align:left;color:var(--muted);font-size:11px;">
+          <th style="padding:10px 12px;">#</th><th style="padding:10px 12px;">Club</th>
+          <th style="padding:10px 8px;text-align:center;">P</th><th style="padding:10px 8px;text-align:center;">W</th>
+          <th style="padding:10px 8px;text-align:center;">D</th><th style="padding:10px 8px;text-align:center;">L</th>
+          <th style="padding:10px 8px;text-align:center;">GD</th><th style="padding:10px 12px;text-align:center;">Pts</th>
+        </tr></thead>
+        <tbody>
+          ${standings.map((r,i) => `
+            <tr style="border-top:1px solid var(--border);${r.club.id===myClubId?'background:rgba(124,58,237,.1);':''}">
+              <td style="padding:10px 12px;color:var(--muted);">${i+1}</td>
+              <td style="padding:10px 12px;font-weight:700;cursor:pointer;" onclick="goToClubFromLeague('${r.club.id}')">${r.club.name}</td>
+              <td style="padding:10px 8px;text-align:center;">${r.played}</td>
+              <td style="padding:10px 8px;text-align:center;">${r.wins}</td>
+              <td style="padding:10px 8px;text-align:center;">${r.draws}</td>
+              <td style="padding:10px 8px;text-align:center;">${r.losses}</td>
+              <td style="padding:10px 8px;text-align:center;">${r.gf-r.ga>0?'+':''}${r.gf-r.ga}</td>
+              <td style="padding:10px 12px;text-align:center;font-weight:800;color:var(--gold);">${r.pts}</td>
+            </tr>`).join('') || `<tr><td colspan="8" style="padding:20px;text-align:center;" class="text-muted">No clubs registered in this competition yet.</td></tr>`}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+async function renderLeagueFixturesSection(fixtures, resultsOnly){
+  const box = document.getElementById('league-profile-section');
+  const list = fixtures.filter(f => resultsOnly ? f.status==='completed' : f.status==='scheduled');
+  await fetchProfilesForClubs(fixtures.flatMap(f=>[f.home_club_id, f.away_club_id]));
+  const byMatchday = {};
+  list.forEach(f => { (byMatchday[f.matchday] = byMatchday[f.matchday]||[]).push(f); });
+
+  box.innerHTML = Object.keys(byMatchday).sort((a,b)=>a-b).map(md => `
+    <div style="margin-bottom:16px;">
+      <div class="text-muted" style="font-size:12px;font-weight:700;margin-bottom:8px;">MATCHDAY ${md}</div>
+      <div style="display:flex;flex-direction:column;gap:8px;">
+        ${byMatchday[md].map(f => `
+          <div class="card fade-in" style="padding:12px 16px;display:flex;align-items:center;justify-content:space-between;cursor:pointer;" onclick="openFixtureModal('${f.id}')">
+            <span style="font-size:13px;flex:1;text-align:right;">${state.clubsById?.[f.home_club_id]?.name || '—'}</span>
+            <span style="padding:0 14px;font-weight:800;font-size:13px;">${f.status==='completed' ? `${f.score_home} - ${f.score_away}` : 'vs'}</span>
+            <span style="font-size:13px;flex:1;">${state.clubsById?.[f.away_club_id]?.name || '—'}</span>
+          </div>`).join('')}
+      </div>
+    </div>`).join('') || `<div class="card" style="padding:24px;text-align:center;"><div class="text-muted" style="font-size:13px;">${resultsOnly ? 'No results yet — no fixtures have been played.' : 'No upcoming fixtures.'}</div></div>`;
+}
+
+async function fetchProfilesForClubs(clubIds){
+  state.clubsById = state.clubsById || {};
+  const missing = [...new Set(clubIds)].filter(id => id && !state.clubsById[id]);
+  if (missing.length) {
+    const { data } = await sb.from('clubs').select('*').in('id', missing);
+    (data||[]).forEach(c => state.clubsById[c.id] = c);
+  }
+}
+
+function renderLeagueStatsSection(standings, fixtures, clubs){
+  const box = document.getElementById('league-profile-section');
+  const completed = fixtures.filter(f=>f.status==='completed');
+  const mostWins = [...standings].sort((a,b)=>b.wins-a.wins)[0];
+  const mostGoals = [...standings].sort((a,b)=>b.gf-a.gf)[0];
+  const bestDefence = standings.filter(r=>r.played>0).sort((a,b)=>a.ga-b.ga)[0];
+  box.innerHTML = `
+    <div class="card fade-in" style="padding:20px;margin-bottom:16px;">
+      <h3 class="font-display" style="margin:0 0 14px;font-size:15px;">Club Stats</h3>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;">
+        <div class="chip" style="padding:12px;"><div style="font-weight:800;font-size:15px;">${mostWins&&mostWins.wins>0 ? mostWins.club.name : '—'}</div><div class="text-muted" style="font-size:11px;">Most Wins ${mostWins&&mostWins.wins>0?`(${mostWins.wins})`:''}</div></div>
+        <div class="chip" style="padding:12px;"><div style="font-weight:800;font-size:15px;">${mostGoals&&mostGoals.gf>0 ? mostGoals.club.name : '—'}</div><div class="text-muted" style="font-size:11px;">Most Goals ${mostGoals&&mostGoals.gf>0?`(${mostGoals.gf})`:''}</div></div>
+        <div class="chip" style="padding:12px;"><div style="font-weight:800;font-size:15px;">${bestDefence ? bestDefence.club.name : '—'}</div><div class="text-muted" style="font-size:11px;">Best Defence ${bestDefence?`(${bestDefence.ga} conceded)`:''}</div></div>
+        <div class="chip" style="padding:12px;"><div style="font-weight:800;font-size:15px;">${completed.length}</div><div class="text-muted" style="font-size:11px;">Matches Played</div></div>
+      </div>
+    </div>
+    <div class="card fade-in" style="padding:20px;">
+      <h3 class="font-display" style="margin:0 0 8px;font-size:15px;">Player Stats</h3>
+      <p class="text-muted" style="font-size:13px;margin:0;">Top scorers and player leaderboards need individual goals attributed to a specific club fixture. Club fixtures currently record an aggregate club score only, so this connects once player-level match events are tracked at the club-fixture level.</p>
+    </div>
+  `;
+}
+
+async function renderLeagueHistorySection(comp){
+  const box = document.getElementById('league-profile-section');
+  const { data: seasons } = await sb.from('seasons').select('*').eq('competition_id', comp.id).order('started_at', { ascending:false });
+  const completedSeasons = (seasons||[]).filter(s=>s.status==='completed');
+  box.innerHTML = `
+    <div class="card fade-in" style="padding:20px;">
+      <h3 class="font-display" style="margin:0 0 10px;font-size:15px;">Season History</h3>
+      ${completedSeasons.length ? completedSeasons.map(s=>`<div style="padding:8px 0;border-bottom:1px solid var(--border);font-size:13px;">${s.label}</div>`).join('') : `<p class="text-muted" style="font-size:13px;margin:0;">No completed seasons yet — ${comp.name}'s ${(seasons||[]).find(s=>s.status==='active')?.label||'current'} season is still underway. Champions, top scorers, and records will appear here once it concludes.</p>`}
+    </div>
+  `;
+}
+
+/* ---- Fixture modal (reuses the generic profile-modal overlay) ---- */
+async function openFixtureModal(fixtureId){
+  const modal = document.getElementById('profile-modal');
+  const body = document.getElementById('profile-modal-body');
+  modal.style.display = 'flex';
+  body.innerHTML = `<div class="skeleton" style="height:180px;border-radius:14px;"></div>`;
+
+  const { data: f } = await sb.from('club_fixtures').select('*').eq('id', fixtureId).single();
+  if (!f) { body.innerHTML = `<p class="text-muted">Fixture not found.</p>`; return; }
+  await fetchProfilesForClubs([f.home_club_id, f.away_club_id]);
+  const { data: admins } = await sb.from('club_admins').select('user_id').in('club_id', [f.home_club_id, f.away_club_id]);
+  const isAdmin = (admins||[]).some(a => a.user_id === state.user.id);
+  const home = state.clubsById[f.home_club_id], away = state.clubsById[f.away_club_id];
+
+  body.innerHTML = `
+    <div style="display:flex;justify-content:flex-end;"><button onclick="closeProfileModal()" style="background:none;border:none;color:var(--muted);font-size:20px;line-height:1;">✕</button></div>
+    <div class="text-muted" style="text-align:center;font-size:11px;font-weight:700;letter-spacing:.05em;margin-bottom:6px;">MATCHDAY ${f.matchday}</div>
+    <div style="display:flex;align-items:center;justify-content:center;gap:18px;margin:14px 0;">
+      <div style="text-align:center;cursor:pointer;" onclick="closeProfileModal(); goToClubFromLeague('${f.home_club_id}')">
+        <div class="glow-purple" style="width:52px;height:52px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-weight:800;margin:0 auto;">${initials(home?.name)}</div>
+        <div style="font-weight:700;font-size:13px;margin-top:6px;">${home?.name||'—'}</div>
+      </div>
+      <div style="font-weight:800;font-size:24px;">${f.status==='completed' ? `${f.score_home} : ${f.score_away}` : 'vs'}</div>
+      <div style="text-align:center;cursor:pointer;" onclick="closeProfileModal(); goToClubFromLeague('${f.away_club_id}')">
+        <div class="glow-purple" style="width:52px;height:52px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-weight:800;margin:0 auto;">${initials(away?.name)}</div>
+        <div style="font-weight:700;font-size:13px;margin-top:6px;">${away?.name||'—'}</div>
+      </div>
+    </div>
+    <div class="text-muted" style="text-align:center;font-size:11px;text-transform:capitalize;">Status: ${f.status}${f.kickoff_at && f.status==='scheduled' ? ' · ' + new Date(f.kickoff_at).toLocaleDateString() : ''}</div>
+    ${isAdmin && f.status==='scheduled' ? `
+      <div style="display:flex;gap:8px;align-items:center;justify-content:center;margin-top:16px;padding-top:14px;border-top:1px solid var(--border);">
+        <input class="input" type="number" min="0" id="fixture-score-home" placeholder="${home?.name||'Home'}" style="width:90px;font-size:12px;padding:6px 10px;"/>
+        <span class="text-muted">-</span>
+        <input class="input" type="number" min="0" id="fixture-score-away" placeholder="${away?.name||'Away'}" style="width:90px;font-size:12px;padding:6px 10px;"/>
+        <button class="btn-gold" style="padding:6px 14px;font-size:12px;" onclick="submitFixtureResult('${f.id}')">Report Result</button>
+      </div>
+      <div class="text-muted" style="text-align:center;font-size:10px;margin-top:6px;">You can report this as a club admin for one of these two clubs.</div>
+    ` : ''}
+  `;
+}
+window.openFixtureModal = openFixtureModal;
+
+async function submitFixtureResult(fixtureId){
+  const h = parseInt(document.getElementById('fixture-score-home').value);
+  const a = parseInt(document.getElementById('fixture-score-away').value);
+  if (isNaN(h) || isNaN(a) || h < 0 || a < 0) { toast('Enter both scores', false); return; }
+  const { error } = await sb.rpc('report_fixture_result', { p_fixture_id: fixtureId, p_score_home: h, p_score_away: a });
+  if (error) { toast(error.message, false); return; }
+  toast('Result reported — table updated 🏆');
+  closeProfileModal();
+  if (state.activeTab === 'league') await renderCompetitionProfile(state.currentCompetitionId);
+}
+window.submitFixtureResult = submitFixtureResult;
+
+
+/* ==========================================================================
+   9. TOURNAMENTS TAB
    ========================================================================== */
 async function renderTournamentsTab(){
   const el = document.getElementById('tab-content');
@@ -1824,7 +2254,7 @@ function subscribeRealtime(){
   const refreshIfActive = debounce(async (tabIds) => {
     if (tabIds.includes(state.activeTab)) {
       const renderers = {
-        feed: loadFeed, career: renderCareerTab, clubs: renderClubsTab,
+        feed: loadFeed, career: renderCareerTab, clubs: renderClubsTab, league: renderLeagueTab,
         tournaments: renderTournamentsTab, rankings: renderRankingsTab,
         pro: renderProPlayersTab, shop: renderShopTab, inbox: renderInboxTab,
       };
@@ -1889,6 +2319,13 @@ function subscribeRealtime(){
     .on('postgres_changes', { event:'INSERT', schema:'public', table:'club_events' }, () => refreshIfActive(['clubs']))
     .subscribe();
   state.channels.push(clubCh);
+
+  // --- league: fixtures/results are shared, standings recompute live ---
+  const leagueCh = sb.channel('rt-league')
+    .on('postgres_changes', { event:'UPDATE', schema:'public', table:'club_fixtures' }, () => refreshIfActive(['league','clubs']))
+    .on('postgres_changes', { event:'INSERT', schema:'public', table:'club_fixtures' }, () => refreshIfActive(['league']))
+    .subscribe();
+  state.channels.push(leagueCh);
 
   // --- feed: posts, likes, comments (global — feed is a shared space) ---
   const feedCh = sb.channel('rt-feed')
